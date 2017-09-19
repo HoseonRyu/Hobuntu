@@ -37,6 +37,8 @@ public:
 protected:
 	virtual void systemCallback(UUID syscallUUID, int pid, const SystemCallParameter& param) final;
 	virtual void packetArrived(std::string fromModule, Packet* packet) final;
+	virtual void syscall_socket(UUID syscallUUID, int pid, int param1, int param2) final;
+	virtual void syscall_close(UUID syscallUUID, int pid, int param1) final;
 };
 
 class TCPAssignmentProvider
@@ -49,6 +51,7 @@ public:
 };
 
 }
+
 
 
 #endif /* E_TCPASSIGNMENT_HPP_ */

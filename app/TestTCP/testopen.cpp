@@ -43,8 +43,11 @@ protected:
 			for(int k=0; k<test_size; k++)
 			{
 				fd_array[k] = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-				if(fd_array[k] < 0)
+				//printf("%d\n",fd_array[k]);
+				if(fd_array[k] < 0){
+					
 					failed++;
+				}
 				else
 					success++;
 			}
@@ -64,6 +67,7 @@ protected:
 		}
 		EXPECT_EQ(success, ((size_t)test_size) * ((size_t)test_repeat));
 		EXPECT_EQ(failed, 0);
+		printf("failed: %d\n", (int)failed);
 		EXPECT_EQ(duplicated, 0);
 	}
 };
