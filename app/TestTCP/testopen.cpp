@@ -33,7 +33,7 @@ protected:
 	void E_Main()
 	{
 		const static int test_size = 1024;
-		const static int test_repeat = 128;
+		const static int test_repeat = 3;
 		size_t failed = 0;
 		size_t duplicated = 0;
 		size_t success = 0;
@@ -43,7 +43,6 @@ protected:
 			for(int k=0; k<test_size; k++)
 			{
 				fd_array[k] = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-				//printf("%d\n",fd_array[k]);
 				if(fd_array[k] < 0){
 					
 					failed++;
@@ -67,7 +66,6 @@ protected:
 		}
 		EXPECT_EQ(success, ((size_t)test_size) * ((size_t)test_repeat));
 		EXPECT_EQ(failed, 0);
-		printf("failed: %d\n", (int)failed);
 		EXPECT_EQ(duplicated, 0);
 	}
 };
