@@ -27,8 +27,14 @@ private:
 	
 public:
 	int fd;
+	
+	int domain;
+	int type;
+	int protocol;
+
 	struct sockaddr addr;
 	bool is_bound;
+
 	SocketObject();
 	SocketObject(int fd);
 	in_port_t get_port();

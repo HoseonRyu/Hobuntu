@@ -64,6 +64,9 @@ uint32_t SocketObject::get_ip_address(){
 void TCPAssignment::syscall_socket(UUID syscallUUID, int pid, int protocolFamily, int type, int protocol){
 	int fd = SystemCallInterface::createFileDescriptor(pid);
 	SocketObject *so = new SocketObject(fd);
+	so->domain = protocolFamily;
+	so->type = type;
+	so->protocol = protocol;
 	this->socket_map[fd] = so;
 	SystemCallInterface::returnSystemCall(syscallUUID, fd);
 }
