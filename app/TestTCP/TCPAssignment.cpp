@@ -139,6 +139,94 @@ void TCPAssignment::syscall_getsockname (UUID syscallUUID, int pid, int sockfd, 
 	SystemCallInterface::returnSystemCall(syscallUUID, 0);
 }
 
+void TCPAssignment::syscall_connect(UUID syscallUUID, int pid, int sockfd, struct sockaddr *serv_addr, socklen_t addrlen) {
+	
+	if(this->socket_map.find(sockfd) == this->socket_map.end()) {
+		// client socket is not constructed
+		SystemCallInterface::returnSystemCall(syscallUUID, -1);
+		return;
+	}
+
+
+	SocketObject *clientSo = socket_map[sockfd];
+
+	uint8_t header[20];
+	memset(header, 0, 20);
+
+	// Get port of client
+	if (!clientSo->is_bound) { // if not bound
+		int port = rand() % 48128 + 1024; // 1024 ~ 49151 random port
+		uint8_t ip[4];
+		this->getHost()->getIPAddr(ip, 0);
+
+		// binding (겹치는거 없을 때까지 <- 안함)
+		struct sockaddr_in client_addr;
+
+		memset(&client_addr, 0, addrlen);
+		
+		client_addr.sin_family = AF_INET;
+		client_addr.sin_port = htons(port);
+		memcpy(&client_addr.sin_addr.s_addr, ip, 4);
+
+		memcpy(&clientSo->addr, &client_addr, addrlen);
+		clientSo->is_bound = true;
+
+		// print (debug)
+		struct in_addr ipst;
+		memcpy(&ipst.s_addr, ip, 4);
+		printf("Client implicit bind: port %d, ip: %s\n", port, inet_ntoa(ipst));
+
+	}
+
+	// Source Port, Destination Port
+	((uint16_t *)header)[0] = clientSo->get_port();
+	((uint16_t *)header)[1] = ((struct sockaddr_in *)serv_addr)->sin_port;
+
+	((uint32_t *)header)[1] = htonl(0); // Sequence Number
+	((uint32_t *)header)[2] = htonl(0); // ACK Number
+	((uint8_t *)header)[12] = 0x50; // Offset
+	((uint8_t *)header)[13] = 0x02; // SYN Flag
+	((uint16_t *)header)[7] = 0x00c8; // Initial Window Size (51200)
+	((uint16_t *)header)[8] = this->get_checksum(header, 20); // Checksum
+
+	this->hex_dump(header, 0, 20); // print function (debugging)
+
+	/* Packet Management */
+	Packet *connPacket = this->allocatePacket(TCP_OFFSET+20);
+	
+	uint8_t src_ip[4];
+	uint8_t dest_ip[4];
+	((uint32_t *)src_ip)[0] = clientSo->get_ip_address();
+	((uint32_t *)dest_ip)[0] = ((struct sockaddr_in *)serv_addr)->sin_addr.s_addr;
+
+	connPacket->writeData(IP_OFFSET+12, src_ip, 4); // Source IP (IP Header)
+	connPacket->writeData(IP_OFFSET+16, dest_ip, 4); // Dest IP (IP Header)
+	connPacket->writeData(TCP_OFFSET, header, 20); // TCP Header
+	this->sendPacket("IPv4", connPacket);
+	//this->freePacket(connPacket);
+}
+
+unsigned short TCPAssignment::get_checksum(void* header, int len){
+	int sum = 0;
+	int i;
+	for (i=0;i<len/2;i++){
+		sum += ((unsigned short *)header)[i];
+		sum = (sum + (sum >> 16)) & 0xFFFF;
+	};
+	return ~((unsigned short)sum);
+}
+
+
+void TCPAssignment::hex_dump(void* buf, int ofs, int size){
+	printf("===========\n");
+	for (int i=0; i<size;i++){
+		printf("%02hhx ", ((char *)buf)[i]);
+		if (i%4 == 3)
+			printf("\n");
+	}
+	printf("===========\n");
+}
+
 void TCPAssignment::systemCallback(UUID syscallUUID, int pid, const SystemCallParameter& param)
 {
 	switch(param.syscallNumber)
@@ -156,8 +244,8 @@ void TCPAssignment::systemCallback(UUID syscallUUID, int pid, const SystemCallPa
 		//this->syscall_write(syscallUUID, pid, param.param1_int, param.param2_ptr, param.param3_int);
 		break;
 	case CONNECT:
-		//this->syscall_connect(syscallUUID, pid, param.param1_int,
-		//		static_cast<struct sockaddr*>(param.param2_ptr), (socklen_t)param.param3_int);
+		this->syscall_connect(syscallUUID, pid, param.param1_int,
+					static_cast<struct sockaddr*>(param.param2_ptr), (socklen_t)param.param3_int);
 		break;
 	case LISTEN:
 		//this->syscall_listen(syscallUUID, pid, param.param1_int, param.param2_int);
@@ -189,7 +277,7 @@ void TCPAssignment::systemCallback(UUID syscallUUID, int pid, const SystemCallPa
 
 void TCPAssignment::packetArrived(std::string fromModule, Packet* packet)
 {
-
+	printf(" packetArrived!\n");
 }
 
 void TCPAssignment::timerCallback(void* payload)

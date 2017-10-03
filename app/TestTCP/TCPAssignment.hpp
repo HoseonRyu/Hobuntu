@@ -35,6 +35,8 @@ public:
 	struct sockaddr addr;
 	bool is_bound;
 
+	Host* host;
+
 	SocketObject();
 	SocketObject(int fd);
 	in_port_t get_port();
@@ -56,13 +58,14 @@ public:
 protected:
 	virtual void systemCallback(UUID syscallUUID, int pid, const SystemCallParameter& param) final;
 	virtual void packetArrived(std::string fromModule, Packet* packet) final;
-	virtual void syscall_socket(UUID syscallUUID, int pid, int protocolFamily, int type, int protoco) final;
-	virtual void syscall_close(UUID syscallUUID, int pid, int param1) final;
-	virtual void syscall_bind(UUID syscallUUID, int pid, int sockfd, struct sockaddr *myaddr, socklen_t addrlen) final;
-	virtual bool is_binding_overlap (SocketObject *so1, SocketObject *so2) final;
-	virtual void syscall_getsockname (UUID syscallUUID, int pid, int sockfd, struct sockaddr *addr, socklen_t *addrlen) final;
-
-
+	void syscall_socket(UUID syscallUUID, int pid, int protocolFamily, int type, int protoco) ;
+	void syscall_close(UUID syscallUUID, int pid, int param1);
+	void syscall_bind(UUID syscallUUID, int pid, int sockfd, struct sockaddr *myaddr, socklen_t addrlen);
+	bool is_binding_overlap (SocketObject *so1, SocketObject *so2);
+	void syscall_getsockname (UUID syscallUUID, int pid, int sockfd, struct sockaddr *addr, socklen_t *addrlen);
+	void syscall_connect(UUID syscallUUID, int pid, int sockfd, struct sockaddr* serv_addr, socklen_t addrlen);
+	void hex_dump(void* buf, int ofs, int size);
+	unsigned short get_checksum(void* header, int len);
 };
 
 class TCPAssignmentProvider
@@ -76,6 +79,7 @@ public:
 
 }
 
-
+#define IP_OFFSET 14
+#define TCP_OFFSET IP_OFFSET+20
 
 #endif /* E_TCPASSIGNMENT_HPP_ */
