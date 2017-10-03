@@ -146,12 +146,14 @@ void TCPAssignment::syscall_connect(UUID syscallUUID, int pid, int sockfd, struc
 		SystemCallInterface::returnSystemCall(syscallUUID, -1);
 		return;
 	}
+	if (addrlen < 0) { // invaild parameter
+		SystemCallInterface::returnSystemCall(syscallUUID, -1);
+		return;
+	}
+
 
 
 	SocketObject *clientSo = socket_map[sockfd];
-
-	uint8_t header[20];
-	memset(header, 0, 20);
 
 	// Get port of client
 	if (!clientSo->is_bound) { // if not bound
@@ -178,6 +180,10 @@ void TCPAssignment::syscall_connect(UUID syscallUUID, int pid, int sockfd, struc
 
 	}
 
+	/* Header Management*/
+	uint8_t header[20];
+	memset(header, 0, 20);
+
 	// Source Port, Destination Port
 	((uint16_t *)header)[0] = clientSo->get_port();
 	((uint16_t *)header)[1] = ((struct sockaddr_in *)serv_addr)->sin_port;
@@ -203,6 +209,8 @@ void TCPAssignment::syscall_connect(UUID syscallUUID, int pid, int sockfd, struc
 	connPacket->writeData(IP_OFFSET+16, dest_ip, 4); // Dest IP (IP Header)
 	connPacket->writeData(TCP_OFFSET, header, 20); // TCP Header
 	this->sendPacket("IPv4", connPacket);
+
+	SystemCallInterface::returnSystemCall(syscallUUID, 0); // connect complete
 	//this->freePacket(connPacket);
 }
 
@@ -282,8 +290,7 @@ void TCPAssignment::packetArrived(std::string fromModule, Packet* packet)
 
 void TCPAssignment::timerCallback(void* payload)
 {
-
+	
 }
-
 
 }
