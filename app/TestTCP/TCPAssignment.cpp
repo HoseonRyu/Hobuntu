@@ -60,6 +60,15 @@ in_port_t SocketObject::get_port(){
 uint32_t SocketObject::get_ip_address(){
 	return ((struct sockaddr_in *)&this->addr)->sin_addr.s_addr;
 }
+void SocketObject::set_family(int family){
+	((struct sockaddr_in *)&this->addr)->sin_family = family;
+}
+void SocketObject::set_port(int port){
+	((struct sockaddr_in *)&this->addr)->sin_port = htons(port);
+}
+void SocketObject::set_ip_address(uint8_t* ip){
+	memcpy (&(((struct sockaddr_in *)&this->addr)->sin_addr.s_addr), ip, 4);
+}
 
 void TCPAssignment::syscall_socket(UUID syscallUUID, int pid, int protocolFamily, int type, int protocol){
 	int fd = SystemCallInterface::createFileDescriptor(pid);
@@ -110,11 +119,7 @@ void TCPAssignment::syscall_bind(UUID syscallUUID, int pid, int sockfd, struct s
 				return;
 			}
 		}
-
 	}  
-
-	// printf("port: %d\n", ntohs(socket_map[sockfd]->get_port()));
-	// printf("IP address: %d\n", ntohl(socket_map[sockfd]->get_ip_address()));
 
 	/****** Binding complete! ******/
 	so->is_bound = true;
@@ -139,6 +144,39 @@ void TCPAssignment::syscall_getsockname (UUID syscallUUID, int pid, int sockfd, 
 	SystemCallInterface::returnSystemCall(syscallUUID, 0);
 }
 
+int TCPAssignment::implicit_bind(int sockfd) {
+	SocketObject *clientSo = socket_map[sockfd];
+	std::map<int, SocketObject*>::iterator iter;
+	
+	uint8_t ip[4];
+	this->getHost()->getIPAddr(ip, 0);
+	clientSo->set_family(AF_INET);
+	clientSo->set_ip_address(ip);
+
+	bool is_overlaped = true;
+
+	while (is_overlaped) {
+		is_overlaped = false;
+		int port = rand() % 48128 + 1024; // 1024 ~ 49151 random port
+		clientSo->set_port(port);
+
+		// check whether port is overlaped
+		for (iter = this->socket_map.begin(); iter != this->socket_map.end(); ++iter){
+			if (!iter->second->is_bound)
+				continue; // don't examine unbound socket
+			else {
+				if (this->is_binding_overlap(clientSo, iter->second)) {
+					is_overlaped = true; // wrong port number
+				}
+			}
+		}
+	}
+
+	// Binding complete
+	clientSo->is_bound = true;
+	return 0;
+}
+
 void TCPAssignment::syscall_connect(UUID syscallUUID, int pid, int sockfd, struct sockaddr *serv_addr, socklen_t addrlen) {
 	
 	if(this->socket_map.find(sockfd) == this->socket_map.end()) {
@@ -151,33 +189,14 @@ void TCPAssignment::syscall_connect(UUID syscallUUID, int pid, int sockfd, struc
 		return;
 	}
 
-
-
 	SocketObject *clientSo = socket_map[sockfd];
 
-	// Get port of client
 	if (!clientSo->is_bound) { // if not bound
-		int port = rand() % 48128 + 1024; // 1024 ~ 49151 random port
-		uint8_t ip[4];
-		this->getHost()->getIPAddr(ip, 0);
-
-		// binding (겹치는거 없을 때까지 <- 안함)
-		struct sockaddr_in client_addr;
-
-		memset(&client_addr, 0, addrlen);
-		
-		client_addr.sin_family = AF_INET;
-		client_addr.sin_port = htons(port);
-		memcpy(&client_addr.sin_addr.s_addr, ip, 4);
-
-		memcpy(&clientSo->addr, &client_addr, addrlen);
-		clientSo->is_bound = true;
-
+		this->implicit_bind (sockfd);
 		// print (debug)
 		struct in_addr ipst;
-		memcpy(&ipst.s_addr, ip, 4);
-		printf("Client implicit bind: port %d, ip: %s\n", port, inet_ntoa(ipst));
-
+		ipst.s_addr = clientSo->get_ip_address();
+		printf("Client implicit bind: port %d, ip: %s\n", clientSo->get_port(), inet_ntoa(ipst));
 	}
 
 	/* Header Management*/
@@ -192,7 +211,7 @@ void TCPAssignment::syscall_connect(UUID syscallUUID, int pid, int sockfd, struc
 	((uint32_t *)header)[2] = htonl(0); // ACK Number
 	((uint8_t *)header)[12] = 0x50; // Offset
 	((uint8_t *)header)[13] = 0x02; // SYN Flag
-	((uint16_t *)header)[7] = 0x00c8; // Initial Window Size (51200)
+	((uint16_t *)header)[7] = htons(51200); // Initial Window Size (51200)
 	((uint16_t *)header)[8] = this->get_checksum(header, 20); // Checksum
 
 	this->hex_dump(header, 0, 20); // print function (debugging)

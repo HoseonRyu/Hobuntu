@@ -41,6 +41,9 @@ public:
 	SocketObject(int fd);
 	in_port_t get_port();
 	uint32_t get_ip_address();
+	void set_family(int family);
+	void set_port(int port);
+	void set_ip_address(uint8_t* ip);
 };
 
 class TCPAssignment : public HostModule, public NetworkModule, public SystemCallInterface, private NetworkLog, private TimerModule
@@ -65,6 +68,7 @@ protected:
 	void syscall_getsockname (UUID syscallUUID, int pid, int sockfd, struct sockaddr *addr, socklen_t *addrlen);
 	void syscall_connect(UUID syscallUUID, int pid, int sockfd, struct sockaddr* serv_addr, socklen_t addrlen);
 	void hex_dump(void* buf, int ofs, int size);
+	int implicit_bind (int sockfd);
 	unsigned short get_checksum(void* header, int len);
 };
 
