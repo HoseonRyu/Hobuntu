@@ -16,15 +16,14 @@
 #include <E/Networking/IPv4/E_IPv4.hpp>
 #include <arpa/inet.h>
 
-
 namespace E
 {
 
 TCPAssignment::TCPAssignment(Host* host) : HostModule("TCP", host),
-		NetworkModule(this->getHostModuleName(), host->getNetworkSystem()),
-		SystemCallInterface(AF_INET, IPPROTO_TCP, host),
-		NetworkLog(host->getNetworkSystem()),
-		TimerModule(host->getSystem())
+NetworkModule(this->getHostModuleName(), host->getNetworkSystem()),
+SystemCallInterface(AF_INET, IPPROTO_TCP, host),
+NetworkLog(host->getNetworkSystem()),
+TimerModule(host->getSystem())
 {
 
 }
@@ -36,38 +35,12 @@ TCPAssignment::~TCPAssignment()
 
 void TCPAssignment::initialize()
 {
-
+	this->socket_map = {};
 }
 
 void TCPAssignment::finalize()
 {
 
-}
-
-SocketObject::SocketObject()
-{
-
-}
-
-SocketObject::SocketObject(int fd) {
-	this->fd = fd;
-	bzero(&this->addr, sizeof(struct sockaddr));
-	this->is_bound = false;
-}
-in_port_t SocketObject::get_port(){
-	return ((struct sockaddr_in *)&this->addr)->sin_port;
-}
-uint32_t SocketObject::get_ip_address(){
-	return ((struct sockaddr_in *)&this->addr)->sin_addr.s_addr;
-}
-void SocketObject::set_family(int family){
-	((struct sockaddr_in *)&this->addr)->sin_family = family;
-}
-void SocketObject::set_port(int port){
-	((struct sockaddr_in *)&this->addr)->sin_port = htons(port);
-}
-void SocketObject::set_ip_address(uint8_t* ip){
-	memcpy (&(((struct sockaddr_in *)&this->addr)->sin_addr.s_addr), ip, 4);
 }
 
 void TCPAssignment::syscall_socket(UUID syscallUUID, int pid, int protocolFamily, int type, int protocol){
@@ -81,7 +54,7 @@ void TCPAssignment::syscall_socket(UUID syscallUUID, int pid, int protocolFamily
 }
 
 void TCPAssignment::syscall_close(UUID syscallUUID, int pid, int fd){
-	delete socket_map[fd];
+	delete this->socket_map[fd];
 	this->socket_map.erase(fd);	
 	SystemCallInterface::removeFileDescriptor(pid, fd);
 	SystemCallInterface::returnSystemCall(syscallUUID, 0);
@@ -102,14 +75,14 @@ void TCPAssignment::syscall_bind(UUID syscallUUID, int pid, int sockfd, struct s
 	std::map<int, SocketObject*>::iterator iter;
 
 	if(this->socket_map.find(sockfd) == this->socket_map.end()) {
-		// socket is not constructed
+	// socket is not constructed
 		SystemCallInterface::returnSystemCall(syscallUUID, -1);
 		return;
 	}
 
 	memcpy(&(this->socket_map[sockfd]->addr), myaddr, addrlen);
 
-	SocketObject* so = socket_map[sockfd];
+	SocketObject* so = this->socket_map[sockfd];
 	for (iter = this->socket_map.begin(); iter != this->socket_map.end(); ++iter){
 		if (!iter->second->is_bound)
 			continue; // examine itself
@@ -133,7 +106,7 @@ void TCPAssignment::syscall_getsockname (UUID syscallUUID, int pid, int sockfd, 
 		return;
 	}
 
-	SocketObject* so = socket_map[sockfd];
+	SocketObject* so = this->socket_map[sockfd];
 	if(!so->is_bound){
 		// socket is not bound.
 		SystemCallInterface::returnSystemCall(syscallUUID, -1);
@@ -144,8 +117,14 @@ void TCPAssignment::syscall_getsockname (UUID syscallUUID, int pid, int sockfd, 
 	SystemCallInterface::returnSystemCall(syscallUUID, 0);
 }
 
+void TCPAssignment::syscall_listen(UUID syscallUUID, int pid, int sockfd, int backlog) {
+	printf("************Listen called!************");
+	SystemCallInterface::returnSystemCall(syscallUUID, 0);	
+}
+
+// Implicit binding with random port(1024~49151) and current ip address 
 int TCPAssignment::implicit_bind(int sockfd) {
-	SocketObject *clientSo = socket_map[sockfd];
+	SocketObject *clientSo = this->socket_map[sockfd];
 	std::map<int, SocketObject*>::iterator iter;
 	
 	uint8_t ip[4];
@@ -154,8 +133,7 @@ int TCPAssignment::implicit_bind(int sockfd) {
 	clientSo->set_ip_address(ip);
 
 	bool is_overlaped = true;
-
-	while (is_overlaped) {
+	while (is_overlaped) { // Repeat until not be overlaped
 		is_overlaped = false;
 		int port = rand() % 48128 + 1024; // 1024 ~ 49151 random port
 		clientSo->set_port(port);
@@ -166,7 +144,7 @@ int TCPAssignment::implicit_bind(int sockfd) {
 				continue; // don't examine unbound socket
 			else {
 				if (this->is_binding_overlap(clientSo, iter->second)) {
-					is_overlaped = true; // wrong port number
+					is_overlaped = true; // overlaped: wrong port number
 				}
 			}
 		}
@@ -189,53 +167,83 @@ void TCPAssignment::syscall_connect(UUID syscallUUID, int pid, int sockfd, struc
 		return;
 	}
 
-	SocketObject *clientSo = socket_map[sockfd];
-
+	SocketObject *clientSo = this->socket_map[sockfd];
 	if (!clientSo->is_bound) { // if not bound
 		this->implicit_bind (sockfd);
-		// print (debug)
-		struct in_addr ipst;
-		ipst.s_addr = clientSo->get_ip_address();
-		printf("Client implicit bind: port %d, ip: %s\n", clientSo->get_port(), inet_ntoa(ipst));
 	}
 
 	/* Header Management*/
 	uint8_t header[20];
 	memset(header, 0, 20);
 
-	// Source Port, Destination Port
-	((uint16_t *)header)[0] = clientSo->get_port();
-	((uint16_t *)header)[1] = ((struct sockaddr_in *)serv_addr)->sin_port;
-
-	((uint32_t *)header)[1] = htonl(0); // Sequence Number
-	((uint32_t *)header)[2] = htonl(0); // ACK Number
-	((uint8_t *)header)[12] = 0x50; // Offset
-	((uint8_t *)header)[13] = 0x02; // SYN Flag
-	((uint16_t *)header)[7] = htons(51200); // Initial Window Size (51200)
-	((uint16_t *)header)[8] = this->get_checksum(header, 20); // Checksum
-
-	this->hex_dump(header, 0, 20); // print function (debugging)
-
-	/* Packet Management */
-	Packet *connPacket = this->allocatePacket(TCP_OFFSET+20);
-	
 	uint8_t src_ip[4];
 	uint8_t dest_ip[4];
 	((uint32_t *)src_ip)[0] = clientSo->get_ip_address();
 	((uint32_t *)dest_ip)[0] = ((struct sockaddr_in *)serv_addr)->sin_addr.s_addr;
 
+	// Source Port, Destination Port
+	((uint16_t *)header)[0] = clientSo->get_port();
+	((uint16_t *)header)[1] = ((struct sockaddr_in *)serv_addr)->sin_port;
+
+	((uint32_t *)header)[1] = htonl(++clientSo->seq_num); // Sequence Number
+	((uint32_t *)header)[2] = htonl(0); // ACK Number
+	((uint8_t *)header)[12] = 0x50; // Offset
+	((uint8_t *)header)[13] = FLAG_SYN; // SYN Flag
+	((uint16_t *)header)[7] = htons(51200); // Initial Window Size (51200)
+	((uint16_t *)header)[8] = this->get_TCPchecksum(header, src_ip, dest_ip, 20); // Checksum
+
+	/* Packet Management */
+	Packet *connPacket = this->allocatePacket(TCP_OFFSET+20);
+	
 	connPacket->writeData(IP_OFFSET+12, src_ip, 4); // Source IP (IP Header)
 	connPacket->writeData(IP_OFFSET+16, dest_ip, 4); // Dest IP (IP Header)
 	connPacket->writeData(TCP_OFFSET, header, 20); // TCP Header
 	this->sendPacket("IPv4", connPacket);
 
-	SystemCallInterface::returnSystemCall(syscallUUID, 0); // connect complete
+	clientSo->syscallUUID = syscallUUID;
+	clientSo->state = State::SYN_SENT;
+
+	//SystemCallInterface::returnSystemCall(syscallUUID, 0); // connect complete
 	//this->freePacket(connPacket);
 }
 
-unsigned short TCPAssignment::get_checksum(void* header, int len){
-	int sum = 0;
+void TCPAssignment::syscall_getpeername(UUID syscallUUID, int pid, int sockfd, struct sockaddr *addr, socklen_t *addrlen){
+	if(this->socket_map.find(sockfd) == this->socket_map.end()) {
+		// client socket is not constructed
+		SystemCallInterface::returnSystemCall(syscallUUID, -1);
+		return;
+	}
+	SocketObject* clientSo = this->socket_map[sockfd];
+	if(clientSo->state != State::ESTABLISHED) {
+		// client socket is not connected
+		SystemCallInterface::returnSystemCall(syscallUUID, -1);
+		return;
+	}
+
+	memcpy(addr, &clientSo->peer_addr, *addrlen);
+	SystemCallInterface::returnSystemCall(syscallUUID, 0);
+}
+
+void TCPAssignment::syscall_accept(UUID syscallUUID, int pid, int sockfd, struct sockaddr *addr, socklen_t *addrlen) {
+	printf("********Accept called********");
+}
+
+unsigned short TCPAssignment::get_TCPchecksum(void* header, uint8_t *src_ip, uint8_t *dest_ip, int len){
+	// Construct pseudo header
+	uint8_t pseudo_header[PSEUDO_HEADER_LEN]; 
+	memset(pseudo_header, 0, PSEUDO_HEADER_LEN);
+	memcpy(pseudo_header, src_ip, 4); // source ip
+	memcpy(pseudo_header+4, dest_ip, 4); // dest ip
+	pseudo_header[9] = 0x06; // TCP protocol
+	((uint16_t *)pseudo_header)[5] = htons ((uint16_t)len); // length
+
+	// Get sum
+	unsigned int sum = 0;
 	int i;
+	for (i=0;i<PSEUDO_HEADER_LEN/2;i++){
+		sum += ((unsigned short *)pseudo_header)[i];
+		sum = (sum + (sum >> 16)) & 0xFFFF;
+	};
 	for (i=0;i<len/2;i++){
 		sum += ((unsigned short *)header)[i];
 		sum = (sum + (sum >> 16)) & 0xFFFF;
@@ -244,6 +252,7 @@ unsigned short TCPAssignment::get_checksum(void* header, int len){
 }
 
 
+// For debug uses
 void TCPAssignment::hex_dump(void* buf, int ofs, int size){
 	printf("===========\n");
 	for (int i=0; i<size;i++){
@@ -258,58 +267,147 @@ void TCPAssignment::systemCallback(UUID syscallUUID, int pid, const SystemCallPa
 {
 	switch(param.syscallNumber)
 	{
-	case SOCKET:
+		case SOCKET:
 		this->syscall_socket(syscallUUID, pid, param.param1_int, param.param2_int, param.param3_int);
 		break;
-	case CLOSE:
+		case CLOSE:
 		this->syscall_close(syscallUUID, pid, param.param1_int);
 		break;
-	case READ:
+		case READ:
 		//this->syscall_read(syscallUUID, pid, param.param1_int, param.param2_ptr, param.param3_int);
 		break;
-	case WRITE:
+		case WRITE:
 		//this->syscall_write(syscallUUID, pid, param.param1_int, param.param2_ptr, param.param3_int);
 		break;
-	case CONNECT:
+		case CONNECT:
 		this->syscall_connect(syscallUUID, pid, param.param1_int,
-					static_cast<struct sockaddr*>(param.param2_ptr), (socklen_t)param.param3_int);
+			static_cast<struct sockaddr*>(param.param2_ptr), (socklen_t)param.param3_int);
 		break;
-	case LISTEN:
-		//this->syscall_listen(syscallUUID, pid, param.param1_int, param.param2_int);
+		case LISTEN:
+		this->syscall_listen(syscallUUID, pid, param.param1_int, param.param2_int);
 		break;
-	case ACCEPT:
-		//this->syscall_accept(syscallUUID, pid, param.param1_int,
-		//		static_cast<struct sockaddr*>(param.param2_ptr),
-		//		static_cast<socklen_t*>(param.param3_ptr));
+		case ACCEPT:
+		this->syscall_accept(syscallUUID, pid, param.param1_int,
+			static_cast<struct sockaddr*>(param.param2_ptr),
+			static_cast<socklen_t*>(param.param3_ptr));
 		break;
-	case BIND:
+		case BIND:
 		this->syscall_bind(syscallUUID, pid, param.param1_int,
-				static_cast<struct sockaddr *>(param.param2_ptr),
-				(socklen_t) param.param3_int);
+			static_cast<struct sockaddr *>(param.param2_ptr),
+			(socklen_t) param.param3_int);
 		break;
-	case GETSOCKNAME:
+		case GETSOCKNAME:
 		this->syscall_getsockname(syscallUUID, pid, param.param1_int,
-				static_cast<struct sockaddr *>(param.param2_ptr),
-				static_cast<socklen_t*>(param.param3_ptr));
+			static_cast<struct sockaddr *>(param.param2_ptr),
+			static_cast<socklen_t*>(param.param3_ptr));
 		break;
-	case GETPEERNAME:
-		//this->syscall_getpeername(syscallUUID, pid, param.param1_int,
-		//		static_cast<struct sockaddr *>(param.param2_ptr),
-		//		static_cast<socklen_t*>(param.param3_ptr));
+		case GETPEERNAME:
+		this->syscall_getpeername(syscallUUID, pid, param.param1_int,
+			static_cast<struct sockaddr *>(param.param2_ptr),
+			static_cast<socklen_t*>(param.param3_ptr));
 		break;
-	default:
+		default:
 		assert(0);
 	}
 }
 
 void TCPAssignment::packetArrived(std::string fromModule, Packet* packet)
 {
-	printf(" packetArrived!\n");
+	//extract address
+	uint8_t src_ip[4];
+	uint8_t dest_ip[4];
+	packet->readData(IP_OFFSET+12, src_ip, 4);
+	packet->readData(IP_OFFSET+16, dest_ip, 4);
+
+	uint8_t src_port[2];
+	uint8_t dest_port[2];
+	packet->readData(TCP_OFFSET+0, src_port, 2);
+	packet->readData(TCP_OFFSET+2, dest_port, 2);
+
+	// Header setting
+	uint8_t header[20];
+	memset(header, 0, 20);
+	packet->readData(TCP_OFFSET, header, 20);
+
+	int seq_num = ntohl(((int *)header)[1]);
+	int ack_num = ntohl(((int *)header)[2]); // ack_num 체크하는거 짜기 (미완)
+	uint8_t flag = header[13];
+
+	int send_seq = 0;
+	SocketObject* clientSo;
+	Packet* myPacket = this->clonePacket(packet);
+
+	/*** Received Message Handling ***/
+	if ((flag & FLAG_SYN) != 0) { // SYN Flag Received  <state조건 확실히 (미완)>
+		clientSo = this->getSocketObject(*((uint32_t *)dest_ip), *((uint16_t *)dest_port));
+		send_seq = ++clientSo->seq_num;
+		
+		//swap ip, port of src/dest
+		myPacket->writeData(IP_OFFSET+12, dest_ip, 4);
+		myPacket->writeData(IP_OFFSET+16, src_ip, 4);
+		memcpy(header, dest_port, 2);
+		memcpy(header+2, src_port, 2);
+
+		((uint32_t *)header)[1] = htonl(send_seq); // Sequence Number
+		((uint32_t *)header)[2] = htonl(seq_num+1); // ACK Number
+		((uint8_t *)header)[13] = FLAG_ACK; // ACK Flag
+		((uint16_t *)header)[8] = 0x0000; // initial checksum
+		((uint16_t *)header)[8] = this->get_TCPchecksum(header, dest_ip, src_ip, 20); // Checksum
+
+		myPacket->writeData(TCP_OFFSET, header, 20);
+		this->sendPacket("IPv4", myPacket);
+		this->freePacket(packet);
+
+		/**** Connection Complete! ****/
+		// Update peer socket of client socket
+		struct sockaddr_in peer_addr;
+		socklen_t len = sizeof(struct sockaddr_in);
+		memset(&peer_addr, 0, len);
+		peer_addr.sin_family = AF_INET;
+		peer_addr.sin_port = *((uint16_t *)src_port);
+		peer_addr.sin_addr.s_addr = *((uint32_t *)src_ip);
+		memcpy(&clientSo->peer_addr, &peer_addr, len);
+		
+		clientSo->state = State::ESTABLISHED; // connection is established
+		SystemCallInterface::returnSystemCall(clientSo->syscallUUID, 0); // unblock connect()
+	}
+
+	if ((flag & FLAG_FIN) != 0){ // FIN flag is set (미완)
+		//swap src and dest
+		myPacket->writeData(IP_OFFSET+12, dest_ip, 4);
+		myPacket->writeData(IP_OFFSET+16, src_ip, 4);
+
+		memcpy(header, dest_port, 2);
+		memcpy(header+2, src_port, 2);
+
+		((uint32_t *)header)[1] = htonl(send_seq); // Sequence Number
+		((uint32_t *)header)[2] = htonl(seq_num+1); // ACK Number
+		((uint8_t *)header)[13] = FLAG_ACK; // ACK Flag
+		((uint16_t *)header)[8] = 0x0000; // initial checksum
+		((uint16_t *)header)[8] = this->get_TCPchecksum(header, dest_ip, src_ip, 20); // Checksum
+
+		myPacket->writeData(TCP_OFFSET, header, 20);
+
+		this->sendPacket("IPv4", myPacket);
+		this->freePacket(packet);
+	}
 }
 
 void TCPAssignment::timerCallback(void* payload)
 {
 	
+}
+
+// Find SocketObject using given ip and port number (network order)
+SocketObject* TCPAssignment::getSocketObject(uint32_t ip, uint16_t port){
+	// ip = 0 인 경우도 고려해서 짜기 (미완)
+	for (auto &kv : this->socket_map){
+		if (kv.second->get_ip_address() == ip && kv.second->get_port() == port) {
+			return kv.second;
+		}
+	}
+
+	return NULL; // Not Found;  	
 }
 
 }
