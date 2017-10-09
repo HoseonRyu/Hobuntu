@@ -16,6 +16,7 @@
 #include <netinet/ip.h>
 #include <netinet/in.h>
 #include <map>
+#include <queue>
 
 #include <E/E_TimerModule.hpp>
 
@@ -24,36 +25,65 @@ namespace E
 
 enum State {
 	CLOSED,
+	LISTEN,
 	SYN_SENT,
-	ESTABLISHED
+	SYN_RECV,
+	ESTABLISHED,
+	FIN_WAIT_1,
+	FIN_WAIT_2,
+	CLOSE_WAIT,
+	CLOSING,
+	LAST_ACK,
+	TIME_WAIT
 };
 
 class SocketObject {
 public:
-	int fd;
+	int fd;							// socket file descriptor
 	
-	int domain;
+	// parameter from socket() function
+	int domain;	
 	int type;
 	int protocol;
 
-	struct sockaddr addr;
-	struct sockaddr peer_addr;
-	bool is_bound;
+	struct sockaddr addr;			// Address information of socket
+	struct sockaddr peer_addr;		// Address information of peer socket
+	bool is_bound;					// true if socket is bound
 
-	State state;
+	State state;					// TCP state
 
-	Host* host;
+	// For TCP Data transfer
 	UUID syscallUUID;
+	int pid;
 	int seq_num;
+
+	// for server socket
+	int accept_fd;
+	bool is_listening;
+	int backlog;
+	struct sockaddr* temp_addr;
+	std::queue<SocketObject *> pending_queue;
 
 	// all of value is network-order
 	SocketObject(){}
 	SocketObject(int fd_){
 		this->fd = fd_;
+
+		// Default Value of Socket (IPv4)
+		this->domain = AF_INET;
+		this->type = SOCK_STREAM;
+		this->protocol = IPPROTO_TCP;
+
 		this->seq_num = 0;
-		bzero(&this->addr, sizeof(struct sockaddr));
+		memset(&this->addr, 0, sizeof(struct sockaddr));
+		memset(&this->peer_addr, 0, sizeof(struct sockaddr));
 		this->is_bound = false;
 		this->state = State::CLOSED;
+
+		this->temp_addr = NULL;
+		this->accept_fd = -1;
+		this->is_listening = false;
+		this->backlog = 0;
 	}
 	sa_family_t get_family(){
 		return ((struct sockaddr_in *)&this->addr)->sin_family;
@@ -124,6 +154,7 @@ public:
 
 
 #define FLAG_ACK 0x10
+#define FLAG_RST 0x04
 #define FLAG_SYN 0x02
 #define FLAG_FIN 0x01
 
