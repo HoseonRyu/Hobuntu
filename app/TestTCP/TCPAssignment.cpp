@@ -27,7 +27,7 @@ SystemCallInterface(AF_INET, IPPROTO_TCP, host),
 NetworkLog(host->getNetworkSystem()),
 TimerModule(host->getSystem())
 {
-
+	
 }
 
 TCPAssignment::~TCPAssignment()
@@ -52,19 +52,45 @@ void TCPAssignment::syscall_socket(UUID syscallUUID, int pid, int protocolFamily
 // so->type = type;
 // so->protocol = protocol;
 
-
 	this->socket_map[pid][fd] = so;
 	SystemCallInterface::returnSystemCall(syscallUUID, fd);
 }
 
 void TCPAssignment::syscall_close(UUID syscallUUID, int pid, int fd){
-	SocketObject* so = this->socket_map[pid][fd];
-	so->is_bound = false;
+	SocketObject* so;
+	if((so = TCPAssignment::getSocketObject(pid, fd)) == NULL) {
+	// socket is not constructed
+		SystemCallInterface::returnSystemCall(syscallUUID, -1);
+		return;
+	}
 
-	delete this->socket_map[pid][fd];
-	this->socket_map[pid].erase(fd);	
-	SystemCallInterface::removeFileDescriptor(pid, fd);
-	SystemCallInterface::returnSystemCall(syscallUUID, 0);
+	if (so->state == State::ESTABLISHED) {
+		// SEND FIN Flag
+		TCPHeader* tcp = new TCPHeader();
+		tcp->src_ip = so->get_ip_address();
+		tcp->src_port = so->get_port();
+		tcp->dest_ip = so->get_ip_address(REMOTE);
+		tcp->dest_port = so->get_port(REMOTE);
+		tcp->seq_num = htonl(so->seq_num++);
+		tcp->offset = 0x50;
+		tcp->flag = FLAG_FIN;
+		tcp->window_size = htons(51200);
+
+		Packet* packet = this->allocatePacket(TCP_OFFSET+20);
+		packet->writeData(0, tcp->calculateHeader(), TCP_OFFSET+20);
+		this->sendPacket("IPv4", packet);
+		delete tcp;
+
+		so->state = State::FIN_WAIT_1;
+		SystemCallInterface::returnSystemCall(syscallUUID, 0);	
+	} else {
+		so->is_bound = false;
+
+		delete this->socket_map[pid][fd];
+		this->socket_map[pid].erase(fd);	
+		SystemCallInterface::removeFileDescriptor(pid, fd);
+		SystemCallInterface::returnSystemCall(syscallUUID, 0);		
+	}
 }
 bool TCPAssignment::is_binding_overlap (SocketObject *so1, SocketObject *so2){
 	uint32_t ip1 = so1->get_ip_address();
@@ -79,12 +105,11 @@ bool TCPAssignment::is_binding_overlap (SocketObject *so1, SocketObject *so2){
 void TCPAssignment::syscall_bind(UUID syscallUUID, int pid, int sockfd, struct sockaddr *myaddr, socklen_t addrlen)
 {
 	SocketObject* so;
-	if((so = getSocketObject(pid, sockfd)) == NULL) {
+	if((so = TCPAssignment::getSocketObject(pid, sockfd)) == NULL) {
 	// socket is not constructed
 		SystemCallInterface::returnSystemCall(syscallUUID, -1);
 		return;
 	}
-
 	memcpy(&(so->local_addr), myaddr, addrlen);
 
 	for (auto &kv : this->socket_map[pid]){
@@ -106,7 +131,7 @@ void TCPAssignment::syscall_bind(UUID syscallUUID, int pid, int sockfd, struct s
 
 void TCPAssignment::syscall_getsockname (UUID syscallUUID, int pid, int sockfd, struct sockaddr *addr, socklen_t *addrlen){
 	SocketObject* so;
-	if((so = getSocketObject(pid, sockfd)) == NULL) {
+	if((so = TCPAssignment::getSocketObject(pid, sockfd)) == NULL) {
 		// socket is not constructed
 		SystemCallInterface::returnSystemCall(syscallUUID, -1);
 		return;
@@ -125,7 +150,7 @@ void TCPAssignment::syscall_getsockname (UUID syscallUUID, int pid, int sockfd, 
 void TCPAssignment::syscall_listen(UUID syscallUUID, int pid, int sockfd, int backlog) {
 	// printf("************ Listen Called! ************\n");
 	SocketObject* so;
-	if((so = getSocketObject(pid, sockfd)) == NULL) {
+	if((so = TCPAssignment::getSocketObject(pid, sockfd)) == NULL) {
 		// socket is not constructed
 		SystemCallInterface::returnSystemCall(syscallUUID, -1);
 		return;
@@ -172,7 +197,7 @@ int TCPAssignment::implicit_bind(int pid, int sockfd) {
 
 void TCPAssignment::syscall_connect(UUID syscallUUID, int pid, int sockfd, struct sockaddr *serv_addr, socklen_t addrlen) {
 	SocketObject* clientSo;
-	if((clientSo = getSocketObject(pid, sockfd)) == NULL) {
+	if((clientSo = TCPAssignment::getSocketObject(pid, sockfd)) == NULL) {
 		// client socket is not constructed
 		SystemCallInterface::returnSystemCall(syscallUUID, -1);
 		return;
@@ -186,45 +211,39 @@ void TCPAssignment::syscall_connect(UUID syscallUUID, int pid, int sockfd, struc
 	if (!clientSo->is_bound) { // if not bound
 		this->implicit_bind (pid, sockfd);
 	}
+	if (VERBOSE)
+		printf("Socket Implicit Bind= port:%d ip:%d\n", 
+			ntohs(clientSo->get_port()), ntohs(clientSo->get_ip_address()));
 
-	/* Header Management*/
-	uint8_t header[20];
-	memset(header, 0, 20);
-
-	uint8_t src_ip[4];
-	uint8_t dest_ip[4];
-	((uint32_t *)src_ip)[0] = clientSo->get_ip_address();
-	((uint32_t *)dest_ip)[0] = ((struct sockaddr_in *)serv_addr)->sin_addr.s_addr;
-
-	// Source Port, Destination Port
-	((uint16_t *)header)[0] = clientSo->get_port();
-	((uint16_t *)header)[1] = ((struct sockaddr_in *)serv_addr)->sin_port;
-
-	((uint32_t *)header)[1] = htonl(clientSo->seq_num++); // Sequence Number
-	((uint32_t *)header)[2] = htonl(0); // ACK Number
-	((uint8_t *)header)[12] = 0x50; // Offset
-	((uint8_t *)header)[13] = FLAG_SYN; // SYN Flag
-	((uint16_t *)header)[7] = htons(51200); // Initial Window Size (51200)
-	((uint16_t *)header)[8] = this->get_TCPchecksum(header, src_ip, dest_ip, 20); // Checksum
-
-	/* Packet Management */
-	Packet *connPacket = this->allocatePacket(TCP_OFFSET+20);
+	/* Header Calculation */
+	TCPHeader* tcp = new TCPHeader();
+	tcp->src_ip = clientSo->get_ip_address();
+	tcp->dest_ip = ((struct sockaddr_in *)serv_addr)->sin_addr.s_addr;
 	
+	tcp->src_port = clientSo->get_port();
+	tcp->dest_port = ((struct sockaddr_in *)serv_addr)->sin_port;
+	
+	tcp->seq_num = htonl(clientSo->seq_num++); // Sequence Number
+	tcp->ack_num = htonl(0); // ACK Number
+	tcp->offset = 0x50; // Offset
+	tcp->flag = FLAG_SYN; // SYN Flag
+	tcp->window_size = htons(51200); // Initial Window Size (51200)
+
 	clientSo->syscallUUID = syscallUUID;
 	clientSo->state = State::SYN_SENT;
 	memcpy(&clientSo->peer_addr, serv_addr, addrlen); 
 
-	connPacket->writeData(IP_OFFSET+12, src_ip, 4); // Source IP (IP Header)
-	connPacket->writeData(IP_OFFSET+16, dest_ip, 4); // Dest IP (IP Header)
-	connPacket->writeData(TCP_OFFSET, header, 20); // TCP Header
+	/* Packet Management */
+	Packet *connPacket = this->allocatePacket(TCP_OFFSET+20);
+	connPacket->writeData(0, tcp->calculateHeader(), TCP_OFFSET+20);
 	this->sendPacket("IPv4", connPacket);
-	//SystemCallInterface::returnSystemCall(syscallUUID, 0); // connect complete
-	//this->freePacket(connPacket);
+	delete tcp;
+
 }
 
 void TCPAssignment::syscall_getpeername(UUID syscallUUID, int pid, int sockfd, struct sockaddr *addr, socklen_t *addrlen){
 	SocketObject* clientSo;
-	if((clientSo = getSocketObject(pid, sockfd)) == NULL) {
+	if((clientSo = TCPAssignment::getSocketObject(pid, sockfd)) == NULL) {
 		// client socket is not constructed
 		SystemCallInterface::returnSystemCall(syscallUUID, -1);
 		return;
@@ -235,7 +254,6 @@ void TCPAssignment::syscall_getpeername(UUID syscallUUID, int pid, int sockfd, s
 		SystemCallInterface::returnSystemCall(syscallUUID, -1);
 		return;
 	}
-
 	memcpy(addr, &clientSo->peer_addr, *addrlen);
 	SystemCallInterface::returnSystemCall(syscallUUID, 0);
 }
@@ -243,7 +261,7 @@ void TCPAssignment::syscall_getpeername(UUID syscallUUID, int pid, int sockfd, s
 void TCPAssignment::syscall_accept(UUID syscallUUID, int pid, int sockfd, struct sockaddr *addr, socklen_t *addrlen) {
 	SocketObject* listenSo;
 	if (VERBOSE) printf("Accept Called!\n");
-	if((listenSo = getSocketObject(pid, sockfd)) == NULL) {
+	if((listenSo = TCPAssignment::getSocketObject(pid, sockfd)) == NULL) {
 		// client socket is not constructed
 		SystemCallInterface::returnSystemCall(syscallUUID, -1);
 		return;
@@ -352,44 +370,27 @@ void TCPAssignment::systemCallback(UUID syscallUUID, int pid, const SystemCallPa
 void TCPAssignment::packetArrived(std::string fromModule, Packet* packet)
 {
 	//printf("Packet Arrived!\n");
-	//extract address
-	uint8_t src_ip[4];
-	uint8_t dest_ip[4];
-	packet->readData(IP_OFFSET+12, src_ip, 4);
-	packet->readData(IP_OFFSET+16, dest_ip, 4);
-
-	uint8_t src_port[2];
-	uint8_t dest_port[2];
-	packet->readData(TCP_OFFSET+0, src_port, 2);
-	packet->readData(TCP_OFFSET+2, dest_port, 2);
-
 	// Header setting
-	uint8_t header[20];
-	memset(header, 0, 20);
-	packet->readData(TCP_OFFSET, header, 20);
+	TCPHeader* tcp = new TCPHeader(packet);
 
-	int seq_num = ntohl(((int *)header)[1]);
-	int ack_num = ntohl(((int *)header)[2]); // ack_num 체크하는거 짜기 (미완)
-	uint8_t flag = header[13];
+	int seq_num = ntohl(tcp->seq_num);
+	int ack_num = ntohl(tcp->ack_num); // ack_num 체크하는거 짜기 (미완)
+	uint8_t flag = tcp->flag;
 
 	int send_seq = 1;
 
 	/*** Received Message Handling ***/
-	//swap ip, port of src/dest
+
+	// Packet* myPacket = this->allocatePacket(TCP_OFFSET+20);
 	Packet* myPacket = this->clonePacket(packet);
-	myPacket->writeData(IP_OFFSET+12, dest_ip, 4);
-	myPacket->writeData(IP_OFFSET+16, src_ip, 4);
-	memcpy(header, dest_port, 2);
-	memcpy(header+2, src_port, 2);
 	
 	SocketObject* recvSo;
 	SocketObject* listenSo;
-	recvSo = this->getSocketObjectByContext(
-		*((uint32_t *)dest_ip), *((uint16_t *)dest_port), *((uint32_t *)src_ip), *((uint16_t *)src_port));	
+	recvSo = TCPAssignment::getSocketObjectByContext(tcp->dest_ip, tcp->dest_port, tcp->src_ip, tcp->src_port);	
 
-	if ((flag & FLAG_SYN) != 0) { // SYN Flag Received	
+	if (IS_SET(flag, FLAG_SYN)) { // SYN Flag Received	
 		if (recvSo == NULL) {
-			listenSo = this->getListenSocketByContext(*((uint32_t *)dest_ip), *((uint16_t *)dest_port));
+			listenSo = TCPAssignment::getListenSocketByContext(tcp->dest_ip, tcp->dest_port);
 			if (listenSo != NULL) {
 				// Server Side
 				if (VERBOSE) printf("LISTEN: SYN is Received!\n");
@@ -402,8 +403,8 @@ void TCPAssignment::packetArrived(std::string fromModule, Packet* packet)
 					socklen_t len = sizeof(struct sockaddr_in);
 
 					int accept_fd = SystemCallInterface::createFileDescriptor(listenSo->pid);
-					SocketObject *acceptSo = new SocketObject(listenSo->pid, accept_fd);
-					memcpy(&acceptSo->local_addr, &listenSo->local_addr, len);
+					SocketObject *acceptSo = new SocketObject(listenSo->pid, accept_fd); // Create new SocketObject
+					memcpy(&acceptSo->local_addr, &listenSo->local_addr, len); // copy address 
 					acceptSo->state = State::SYN_RECV;
 					acceptSo->is_bound = true;
 
@@ -411,8 +412,8 @@ void TCPAssignment::packetArrived(std::string fromModule, Packet* packet)
 					struct sockaddr_in peer_addr;
 					memset(&peer_addr, 0, len);
 					peer_addr.sin_family = AF_INET;
-					peer_addr.sin_port = *((uint16_t *)src_port);
-					peer_addr.sin_addr.s_addr = *((uint32_t *)src_ip);
+					peer_addr.sin_port = tcp->src_port;
+					peer_addr.sin_addr.s_addr = tcp->src_ip;
 					memcpy(&acceptSo->peer_addr, &peer_addr, len);
 
 					// Insert accept_fd into socket_map
@@ -425,32 +426,23 @@ void TCPAssignment::packetArrived(std::string fromModule, Packet* packet)
 					
 				}
 
-				((uint32_t *)header)[1] = htonl(listenSo->seq_num++); // Sequence Number
-				((uint32_t *)header)[2] = htonl(seq_num+1); // ACK Number
+				// Packet Management
+				tcp->swap_ip();
+				tcp->swap_port();
+				tcp->seq_num = htonl(listenSo->seq_num++); // Sequence Number
+				tcp->ack_num = htonl(seq_num+1); // ACK Number
 				if (success)
-					((uint8_t *)header)[13] = FLAG_ACK | FLAG_SYN; // SYN, ACK Flag
+					tcp->flag = FLAG_ACK | FLAG_SYN; // SYN, ACK Flag
 				else
-					((uint8_t *)header)[13] = FLAG_ACK | FLAG_RST; // RST, ACK Flag
-				((uint16_t *)header)[8] = 0x0000; // initial checksum
-				((uint16_t *)header)[8] = this->get_TCPchecksum(header, dest_ip, src_ip, 20); // Checksum
-				myPacket->writeData(TCP_OFFSET, header, 20);
+					tcp->flag = FLAG_ACK | FLAG_RST; // RST, ACK Flag
+				myPacket->writeData(0, tcp->calculateHeader(), TCP_OFFSET+20);
 				this->sendPacket("IPv4", myPacket);
-				this->freePacket(packet);
 			}
 		} else {
 			if (recvSo->state == State::SYN_SENT) { // Client Side
 				/*** Client: SYN Received! Connection Established! Send ACK ***/
 				if (VERBOSE) printf("Client: Connection Established!\n");
 
-				((uint32_t *)header)[1] = htonl(ack_num); // Sequence Number
-				((uint32_t *)header)[2] = htonl(seq_num+1); // ACK Number
-				((uint8_t *)header)[13] = FLAG_ACK; // ACK Flag
-				((uint16_t *)header)[8] = 0x0000; // initial checksum
-				((uint16_t *)header)[8] = this->get_TCPchecksum(header, dest_ip, src_ip, 20); // Checksum
-
-				myPacket->writeData(TCP_OFFSET, header, 20);
-				this->sendPacket("IPv4", myPacket);
-				this->freePacket(packet);
 
 				/**** Connection ESTABLISHED! ****/
 				// Update peer socket of client socket
@@ -458,21 +450,29 @@ void TCPAssignment::packetArrived(std::string fromModule, Packet* packet)
 				socklen_t len = sizeof(struct sockaddr_in);
 				memset(&peer_addr, 0, len);
 				peer_addr.sin_family = AF_INET;
-				peer_addr.sin_port = *((uint16_t *)src_port);
-				peer_addr.sin_addr.s_addr = *((uint32_t *)src_ip);
+				peer_addr.sin_port = tcp->src_port;
+				peer_addr.sin_addr.s_addr = tcp->src_ip;
 				memcpy(&recvSo->peer_addr, &peer_addr, len);
-					
 				recvSo->state = State::ESTABLISHED; 
+					
+				// Packet Management
+				tcp->swap_ip();
+				tcp->swap_port();
+				tcp->seq_num = htonl(ack_num); // Sequence Number
+				tcp->ack_num = htonl(seq_num+1); // ACK Number
+				tcp->flag = FLAG_ACK; // ACK Flag
+				myPacket->writeData(0, tcp->calculateHeader(), TCP_OFFSET+20);
+				this->sendPacket("IPv4", myPacket);
 				SystemCallInterface::returnSystemCall(recvSo->syscallUUID, 0); // unblock connect()
 			} 	
 		}
 	} else if (recvSo != NULL && recvSo->state == State::SYN_RECV) { // Server Side
-		if ((flag & FLAG_ACK) != 0) { // ACK is Received
+		if (IS_SET(flag, FLAG_ACK)) { // ACK is Received
 			if (VERBOSE) printf("SERVER: ACK is Received!\n");
 			/**** Connection ESTABLISHED! ****/
 			recvSo->state = State::ESTABLISHED; // connection is established
 
-			listenSo = this->getListenSocketByContext(*((uint32_t *)dest_ip), *((uint16_t *)dest_port));
+			listenSo = this->getListenSocketByContext(tcp->dest_ip, tcp->dest_port);
 			listenSo->backlog--; // update backlog value
 			
 			if (listenSo->temp_addr != NULL) { // accept() is already called
@@ -485,19 +485,18 @@ void TCPAssignment::packetArrived(std::string fromModule, Packet* packet)
 			}
 		}
 	}
-	if ((flag & FLAG_FIN) != 0) { // FIN flag is set (미완)
-		((uint32_t *)header)[1] = htonl(send_seq); // Sequence Number
-		((uint32_t *)header)[2] = htonl(seq_num+1); // ACK Number
-		((uint8_t *)header)[13] = FLAG_ACK; // ACK Flag
-		((uint16_t *)header)[8] = 0x0000; // initial checksum
-		((uint16_t *)header)[8] = this->get_TCPchecksum(header, dest_ip, src_ip, 20); // Checksum
-
-		myPacket->writeData(TCP_OFFSET, header, 20);
+	if (IS_SET(flag, FLAG_FIN)) { // FIN flag is set (미완)
+		tcp->swap_ip();
+		tcp->swap_port();
+		tcp->seq_num = htonl(recvSo->seq_num++); // Sequence Number
+		tcp->ack_num = htonl(seq_num+1); // ACK Number
+		tcp->flag = FLAG_ACK; // ACK Flag
+		myPacket->writeData(0, tcp->calculateHeader(), TCP_OFFSET+20);
 
 		this->sendPacket("IPv4", myPacket);
-		this->freePacket(packet);
-
 	}
+	this->freePacket(packet);
+	delete tcp;
 }
 
 // backlog 안되면 지우는거?
