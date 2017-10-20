@@ -24,6 +24,7 @@
 #define TCP_OFFSET IP_OFFSET+20
 #define PSEUDO_HEADER_LEN 12
 
+#define LOCAL true
 #define REMOTE false
 
 #define FLAG_ACK 0x10
@@ -68,27 +69,27 @@ public:
 	int type;
 	int protocol;
 	*/
-	struct sockaddr local_addr;			// Address information of socket
+	struct sockaddr local_addr;		// Address information of current socket
 	struct sockaddr peer_addr;		// Address information of peer socket
 	bool is_bound;					// true if socket is bound
+	bool is_peer_set;				// true if peer_addr is set
 
 	State state;					// TCP state
+
+	// For Server socket
+	bool is_listening;				// true if socket si listening
+	bool is_established;			// true if already established
+	int backlog_max;				// maximum number of backlog value
+	struct sockaddr* temp_addr;		// used for accept() parameter transfer
+
+	int backlog;					// the number of connections which are not “ESTABLISHED”
+	std::queue<SocketObject *> pending_queue;
 
 	// For Internel Data transfer
 	UUID syscallUUID;
 	int seq_num;
 	int ack_num;
 
-	// For Server socket
-	int accept_fd;
-	bool is_listening;
-	int backlog_max;
-	struct sockaddr* temp_addr;
-
-	int backlog;
-	std::queue<SocketObject *> pending_queue;
-
-	// all of value is network-order
 	SocketObject(){}
 	SocketObject(int pid_, int fd_){
 		this->pid = pid_;
@@ -101,17 +102,24 @@ public:
 		// this->protocol = IPPROTO_TCP;
 
 		this->seq_num = 0;
+		this->ack_num = 0;
 		memset(&this->local_addr, 0, sizeof(struct sockaddr));
 		memset(&this->peer_addr, 0, sizeof(struct sockaddr));
 		this->is_bound = false;
 		this->state = State::CLOSED;
+		this->is_peer_set = false;
+		this->is_established = false;
 
 		this->temp_addr = NULL;
-		this->accept_fd = -1;
 		this->is_listening = false;
 		this->backlog_max = 0;
 		this->backlog = 0;
 	}
+
+	/* helper function of socket addresss 
+	 * if local is TRUE or blank, returns local_addr
+	 * otherwise, returns peer_addr
+	 * All value is network-order */
 	sa_family_t get_family(bool local = true){
 		struct sockaddr *addr = (local) ? &this->local_addr : &this->peer_addr;
 		return ((struct sockaddr_in *)addr)->sin_family;
@@ -130,15 +138,19 @@ public:
 	}
 	void set_port(int port, bool local = true){
 		struct sockaddr *addr = (local) ? &this->local_addr : &this->peer_addr;
-		((struct sockaddr_in *)addr)->sin_port = htons(port);
+		((struct sockaddr_in *)addr)->sin_port = port;
 	}
 	void set_ip_address(uint8_t* ip, bool local = true){
 		struct sockaddr *addr = (local) ? &this->local_addr : &this->peer_addr;
 		memcpy (&(((struct sockaddr_in *)addr)->sin_addr.s_addr), ip, 4);
 	}
+	void set_ip_address(uint32_t ip, bool local = true){
+		struct sockaddr *addr = (local) ? &this->local_addr : &this->peer_addr;
+		((struct sockaddr_in *)addr)->sin_addr.s_addr = ip;
+	}
 };
 
-/* TCP Header Class for Packet <-> TCP Header Management
+/* TCP Header Class for E::Packet <-> TCP Header Management
  * ALL values is network-ordered */
 class TCPHeader {
 private:
@@ -276,7 +288,8 @@ protected:
 	bool is_binding_overlap (SocketObject *so1, SocketObject *so2);
 	void hex_dump(void* buf, int ofs, int size);
 	int implicit_bind (int pid, int sockfd);
-	unsigned short get_TCPchecksum(void* header, uint8_t *src_ip, uint8_t *dest_ip, int len);
+
+	void send_ACK_Packet(int ack_num, SocketObject* so, TCPHeader* tcp, Packet* packet);
 };
 
 class TCPAssignmentProvider
