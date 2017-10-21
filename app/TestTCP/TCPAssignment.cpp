@@ -14,6 +14,7 @@
 #include <E/Networking/E_NetworkUtil.hpp>
 #include "TCPAssignment.hpp"
 #include <E/Networking/IPv4/E_IPv4.hpp>
+#include <E/E_TimeUtil.hpp>
 #include <arpa/inet.h>
 
 #define VERBOSE 0
@@ -67,7 +68,14 @@ void TCPAssignment::syscall_close(UUID syscallUUID, int pid, int fd){
 	if (so->is_peer_set) {
 		// SEND FIN Flag
 		TCPHeader* tcp = new TCPHeader();
-		tcp->src_ip = so->get_ip_address();
+		if (so->get_ip_address() == 0) {
+			uint8_t ip[4];
+			this->getHost()->getIPAddr(ip, 0);
+			tcp->src_ip = *(uint32_t *)ip;
+		} else {
+			tcp->src_ip = so->get_ip_address();
+		}
+
 		tcp->src_port = so->get_port();
 		tcp->dest_ip = so->get_ip_address(REMOTE);
 		tcp->dest_port = so->get_port(REMOTE);
@@ -81,6 +89,7 @@ void TCPAssignment::syscall_close(UUID syscallUUID, int pid, int fd){
 		this->sendPacket("IPv4", packet);
 		delete tcp;
 		so->ack_num = so->seq_num+1;
+		so->seq_num++;
 
 		// change state
 		if (so->state == State::CLOSE_WAIT){ // server
@@ -133,11 +142,6 @@ void TCPAssignment::syscall_bind(UUID syscallUUID, int pid, int sockfd, struct s
 	}
 
 	/****** Binding complete! ******/
-	if (so->get_ip_address() == 0) {
-		uint8_t ip[4];
-		this->getHost()->getIPAddr(ip, 0);
-		so->set_ip_address(ip);
-	}
 	so->is_bound = true;
 	SystemCallInterface::returnSystemCall(syscallUUID, 0);
 }
@@ -240,7 +244,14 @@ void TCPAssignment::syscall_connect(UUID syscallUUID, int pid, int sockfd, struc
 
 	/* Header Calculation */
 	TCPHeader* tcp = new TCPHeader();
-	tcp->src_ip = clientSo->get_ip_address();
+
+	if (clientSo->get_ip_address() == 0) {
+		uint8_t ip[4];
+		this->getHost()->getIPAddr(ip, 0);
+		tcp->src_ip = *(uint32_t *)ip;
+	} else {
+		tcp->src_ip = clientSo->get_ip_address();
+	}
 	tcp->dest_ip = ((struct sockaddr_in *)serv_addr)->sin_addr.s_addr;
 	
 	tcp->src_port = clientSo->get_port();
@@ -256,14 +267,14 @@ void TCPAssignment::syscall_connect(UUID syscallUUID, int pid, int sockfd, struc
 	clientSo->state = State::SYN_SENT;
 	memcpy(&clientSo->peer_addr, serv_addr, addrlen); // set peer_addr
 	clientSo->is_peer_set = true; 
-	clientSo->ack_num = clientSo->seq_num+1;
 
 	/* Packet Management */
 	Packet *connPacket = this->allocatePacket(TCP_OFFSET+20);
 	connPacket->writeData(0, tcp->calculateHeader(), TCP_OFFSET+20);
 	this->sendPacket("IPv4", connPacket);
 	delete tcp;
-
+	clientSo->ack_num = clientSo->seq_num+1;
+	clientSo->seq_num++;
 }
 
 void TCPAssignment::syscall_getpeername(UUID syscallUUID, int pid, int sockfd, struct sockaddr *addr, socklen_t *addrlen){
@@ -405,9 +416,9 @@ void TCPAssignment::packetArrived(std::string fromModule, Packet* packet)
 	}
 
 	// Sequence Number Handle
-	if (recvSo != NULL && IS_SET(flag, FLAG_ACK) && recvSo->ack_num == ntohl(tcp->ack_num)) {
-		recvSo->seq_num++;
-	}
+	// if (recvSo != NULL && IS_SET(flag, FLAG_ACK) && recvSo->ack_num == ntohl(tcp->ack_num)) {
+	// 	recvSo->seq_num++;
+	// }
 
 	if (IS_SET(flag, FLAG_SYN)) { // SYN Flag Received	
 		if (recvSo == NULL) {
@@ -426,7 +437,7 @@ void TCPAssignment::packetArrived(std::string fromModule, Packet* packet)
 				memcpy(&acceptSo->local_addr, &listenSo->local_addr, len); // copy address 
 				acceptSo->state = State::SYN_RECV;
 				acceptSo->is_bound = true;
-				acceptSo->seq_num = listenSo->seq_num;
+				acceptSo->seq_num = listenSo->seq_num+1; // packet will be sent
 				acceptSo->ack_num = listenSo->ack_num+1; // packet will be sent
 
 				// Update peer socket of server socket
@@ -479,12 +490,13 @@ void TCPAssignment::packetArrived(std::string fromModule, Packet* packet)
 					// Packet Management
 					tcp->swap_ip();
 					tcp->swap_port();
-					tcp->seq_num = htonl(recvSo->seq_num); // Sequence Number
+					tcp->seq_num = htonl(recvSo->seq_num-1); // Sequence Number
 					tcp->ack_num = htonl(seq_num+1); // ACK Number
 					tcp->flag = FLAG_ACK | FLAG_SYN; // SYN+ACK Flag
 					myPacket->writeData(0, tcp->calculateHeader(), TCP_OFFSET+20);
 					this->sendPacket("IPv4", myPacket);
 					recvSo->ack_num = recvSo->seq_num+1;
+					// recvSo->seq_num++;
 
 				}
 			} else if (recvSo->state == State::SYN_RECV) {
@@ -532,11 +544,13 @@ void TCPAssignment::packetArrived(std::string fromModule, Packet* packet)
 
 					this->send_ACK_Packet(seq_num+1, recvSo, tcp, myPacket);
 
-					// TO DO : TIME_WAIT timeout 
+					// TIME_WAIT timeout
+					TimerPayload* tp = new TimerPayload(TIMER::TIME_WAIT, recvSo);
+					TimerModule::addTimer(tp, TimeUtil::makeTime(TCP_TIMEWAIT_LEN, TimeUtil::SEC));
 				} else {
 					if (VERBOSE) printf("Client %d: FIN_WAIT_1 -> CLOSING\n", recvSo->fd);
 					recvSo->state = State::CLOSING;
-					this->send_ACK_Packet(seq_num+1, recvSo, tcp, myPacket);
+					//this->send_ACK_Packet(seq_num+1, recvSo, tcp, myPacket);
 				}
 			} else if (recvSo->state == State::FIN_WAIT_2) { // client
 				if (VERBOSE) printf("Client %d: FIN_WAIT_2 -> TIME_WAIT\n", recvSo->fd);
@@ -544,7 +558,9 @@ void TCPAssignment::packetArrived(std::string fromModule, Packet* packet)
 
 				this->send_ACK_Packet(seq_num+1, recvSo, tcp, myPacket);
 
-				// TO DO : TIME_WAIT timeout 
+				// TIME_WAIT timeout
+				TimerPayload* tp = new TimerPayload(TIMER::TIME_WAIT, recvSo);
+				TimerModule::addTimer(tp, TimeUtil::makeTime(TCP_TIMEWAIT_LEN, TimeUtil::SEC));
 			}
 		}
 	} else if (IS_SET(flag, FLAG_ACK)) {
@@ -565,9 +581,11 @@ void TCPAssignment::packetArrived(std::string fromModule, Packet* packet)
 			if (VERBOSE) printf("Socket %d: CLOSING -> TIME_WAIT\n", recvSo->fd);
 			recvSo->state = State::TIME_WAIT;
 
-			// this->send_ACK_Packet(seq_num, recvSo, tcp, myPacket);
+			this->send_ACK_Packet(seq_num, recvSo, tcp, myPacket);
 
-			// TO DO: TIME_WAIT timeout
+			// TIME_WAIT timeout
+			TimerPayload* tp = new TimerPayload(TIMER::TIME_WAIT, recvSo);
+			TimerModule::addTimer(tp, TimeUtil::makeTime(TCP_TIMEWAIT_LEN, TimeUtil::SEC));
 		}
 	}
 	this->freePacket(packet);
@@ -576,7 +594,18 @@ void TCPAssignment::packetArrived(std::string fromModule, Packet* packet)
 
 void TCPAssignment::timerCallback(void* payload)
 {
-	
+	TimerPayload* tp = (TimerPayload* )payload;
+	SocketObject *targetSo = tp->so;
+
+	if (tp->type == TIMER::TIME_WAIT) {
+		/* Socket Termination */
+		int pid = targetSo->pid;
+		int fd = targetSo->fd;
+		delete this->socket_map[pid][fd];
+		this->socket_map[pid].erase(fd);
+		if (VERBOSE) printf("Socket %d Terminated\n", fd);
+	}
+	delete tp;
 }
 
 void TCPAssignment::send_ACK_Packet(int ack_num, SocketObject* so, TCPHeader* tcp, Packet* packet){
@@ -645,12 +674,5 @@ SocketObject* TCPAssignment::getListenSocketByContext(uint32_t local_ip, uint16_
 }
 
 /* TO DO List
-	Close State 구현
-	Time out
-	Backlog에서 거절 당하면 socket 처리
 	client -- RST 받았을때 구현
-	Connect - Close 구현
-	Accept Synchronize 확인
-	잘못 왔을때도 ACK 보내기
-
 	*/

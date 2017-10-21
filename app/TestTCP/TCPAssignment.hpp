@@ -32,49 +32,47 @@
 #define FLAG_SYN 0x02
 #define FLAG_FIN 0x01
 
+#define TCP_TIMEWAIT_LEN 60
+
 #define IS_SET(flag, test) ((flag & test) != 0)
 
 namespace E
 {
 
-enum State {
-	CLOSED,
-	LISTEN,
-	SYN_SENT,
-	SYN_RECV,
-	ESTABLISHED,
-	FIN_WAIT_1,
-	FIN_WAIT_2,
-	CLOSE_WAIT,
-	CLOSING,
-	LAST_ACK,
-	TIME_WAIT
-};
+namespace State {
+	enum Enum {
+		CLOSED,
+		LISTEN,
+		SYN_SENT,
+		SYN_RECV,
+		ESTABLISHED,
+		FIN_WAIT_1,
+		FIN_WAIT_2,
+		CLOSE_WAIT,
+		CLOSING,
+		LAST_ACK,
+		TIME_WAIT
+	};
+}
 
-enum SOCKET {
-	CLIENT,
-	SERVER,
-	NONE = -1
-};
-
+/* Used by Timer callback */
+namespace TIMER {
+	enum Enum { 
+		TIME_WAIT
+	};
+}
+/* SocketObject that represents each socket status */
 class SocketObject {
 public:
 	int fd;							// socket file descriptor
 	int pid;						// process id
-	int type;						// is socket client or server?
 
-	/*
-	// parameter from socket() function
-	int domain;	
-	int type;
-	int protocol;
-	*/
 	struct sockaddr local_addr;		// Address information of current socket
 	struct sockaddr peer_addr;		// Address information of peer socket
 	bool is_bound;					// true if socket is bound
 	bool is_peer_set;				// true if peer_addr is set
 
-	State state;					// TCP state
+	int state;					// TCP state
 
 	// For Server socket
 	bool is_listening;				// true if socket si listening
@@ -88,13 +86,12 @@ public:
 	// For Internel Data transfer
 	UUID syscallUUID;
 	int seq_num;
-	int ack_num;
+	uint32_t ack_num;
 
 	SocketObject(){}
 	SocketObject(int pid_, int fd_){
 		this->pid = pid_;
 		this->fd = fd_;
-		this->type = SOCKET::NONE;
 
 		// // Default Value of Socket (IPv4)
 		// this->domain = AF_INET;
@@ -254,6 +251,16 @@ private:
 			sum = (sum + (sum >> 16)) & 0xFFFF;
 		};
 		return ~((unsigned short)sum);
+	}
+};
+
+class TimerPayload {
+public: 
+	int type;
+	SocketObject* so;
+	TimerPayload(int type_, SocketObject* so_){
+		this->type = type_;
+		this->so = so_;
 	}
 };
 
