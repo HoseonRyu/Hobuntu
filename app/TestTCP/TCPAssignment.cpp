@@ -15,6 +15,7 @@
 #include "TCPAssignment.hpp"
 #include <E/Networking/IPv4/E_IPv4.hpp>
 #include <E/E_TimeUtil.hpp>
+#include <E/E_TimerModule.hpp>
 #include <arpa/inet.h>
 
 #define VERBOSE 0
@@ -33,7 +34,7 @@ TimerModule(host->getSystem())
 
 TCPAssignment::~TCPAssignment()
 {
-
+	
 }
 
 void TCPAssignment::initialize()
@@ -397,8 +398,9 @@ void TCPAssignment::packetArrived(std::string fromModule, Packet* packet)
 	SocketObject* recvSo;
 	SocketObject* listenSo;
 	recvSo = TCPAssignment::getSocketObjectByContext(tcp->dest_ip, tcp->dest_port, tcp->src_ip, tcp->src_port);	
-	listenSo = TCPAssignment::getListenSocketByContext(tcp->dest_ip, tcp->dest_port);
-	if (recvSo == NULL && listenSo == NULL) {
+	if (recvSo == NULL)
+		recvSo = TCPAssignment::getListenSocketByContext(tcp->dest_ip, tcp->dest_port);
+	if (recvSo == NULL) {
 		// no socket to handle
 		if (flag != FLAG_ACK) {
 			// just send ACK for packet
@@ -415,64 +417,62 @@ void TCPAssignment::packetArrived(std::string fromModule, Packet* packet)
 		}
 	}
 
-	// Sequence Number Handle
-	// if (recvSo != NULL && IS_SET(flag, FLAG_ACK) && recvSo->ack_num == ntohl(tcp->ack_num)) {
-	// 	recvSo->seq_num++;
-	// }
+	switch (recvSo->state) {
+		case State::LISTEN:
+		{
+			if (IS_SET(flag, FLAG_SYN)){
+				if (VERBOSE) printf("LISTEN: SYN is Received!\n");
 
-	if (IS_SET(flag, FLAG_SYN)) { // SYN Flag Received	
-		if (recvSo == NULL) {
-			// Server Side (Listen Socket)
-			if (VERBOSE) printf("LISTEN: SYN is Received!\n");
+				/*** Server: Connection Request (SYN) Received! Send SYN+ACK ***/
 
-			/*** Server: Connection Request (SYN) Received! Send SYN+ACK ***/
+				// Context Creation
+				bool success = false;
+				if (recvSo->backlog < recvSo->backlog_max ) { // check backlog value
+					socklen_t len = sizeof(struct sockaddr_in);
 
-			// Context Creation
-			bool success = false;
-			if (listenSo->backlog < listenSo->backlog_max ) { // check backlog value
-				socklen_t len = sizeof(struct sockaddr_in);
+					int accept_fd = SystemCallInterface::createFileDescriptor(recvSo->pid);
+					SocketObject *acceptSo = new SocketObject(recvSo->pid, accept_fd); // Create new SocketObject
+					memcpy(&acceptSo->local_addr, &recvSo->local_addr, len); // copy address 
+					acceptSo->state = State::SYN_RECV;
+					acceptSo->is_bound = true;
+					acceptSo->seq_num = recvSo->seq_num+1; // packet will be sent
+					acceptSo->ack_num = recvSo->ack_num+1; // packet will be sent
 
-				int accept_fd = SystemCallInterface::createFileDescriptor(listenSo->pid);
-				SocketObject *acceptSo = new SocketObject(listenSo->pid, accept_fd); // Create new SocketObject
-				memcpy(&acceptSo->local_addr, &listenSo->local_addr, len); // copy address 
-				acceptSo->state = State::SYN_RECV;
-				acceptSo->is_bound = true;
-				acceptSo->seq_num = listenSo->seq_num+1; // packet will be sent
-				acceptSo->ack_num = listenSo->ack_num+1; // packet will be sent
+					// Update peer socket of server socket
+					acceptSo->set_family(AF_INET, REMOTE);
+					acceptSo->set_port(tcp->src_port, REMOTE);
+					acceptSo->set_ip_address(tcp->src_ip, REMOTE);
+					acceptSo->is_peer_set = true;
 
-				// Update peer socket of server socket
-				acceptSo->set_family(AF_INET, REMOTE);
-				acceptSo->set_port(tcp->src_port, REMOTE);
-				acceptSo->set_ip_address(tcp->src_ip, REMOTE);
-				acceptSo->is_peer_set = true;
+					// Insert accept_fd into socket_map
+					this->socket_map[recvSo->pid][accept_fd] = acceptSo;
 
-				// Insert accept_fd into socket_map
-				this->socket_map[listenSo->pid][accept_fd] = acceptSo;
+					if (VERBOSE) printf("Context Created...\n");
+					recvSo->pending_queue.push(acceptSo);
+					recvSo->backlog++;
+					success = true;
+					
+				}
 
-				if (VERBOSE) printf("Context Created...\n");
-				listenSo->pending_queue.push(acceptSo);
-				listenSo->backlog++;
-				success = true;
-				
+				// Packet Management
+				tcp->swap_ip();
+				tcp->swap_port();
+				tcp->seq_num = htonl(recvSo->seq_num); // Sequence Number
+				tcp->ack_num = htonl(seq_num+1); // ACK Number
+				if (success)
+					tcp->flag = FLAG_ACK | FLAG_SYN; // SYN, ACK Flag
+				else
+					tcp->flag = FLAG_ACK | FLAG_RST; // RST, ACK Flag
+				myPacket->writeData(0, tcp->calculateHeader(), TCP_OFFSET+20);
+				this->sendPacket("IPv4", myPacket);
+				recvSo->ack_num = recvSo->seq_num+1;
 			}
-
-			// Packet Management
-			tcp->swap_ip();
-			tcp->swap_port();
-			tcp->seq_num = htonl(listenSo->seq_num); // Sequence Number
-			tcp->ack_num = htonl(seq_num+1); // ACK Number
-			if (success)
-				tcp->flag = FLAG_ACK | FLAG_SYN; // SYN, ACK Flag
-			else
-				tcp->flag = FLAG_ACK | FLAG_RST; // RST, ACK Flag
-			myPacket->writeData(0, tcp->calculateHeader(), TCP_OFFSET+20);
-			this->sendPacket("IPv4", myPacket);
-			listenSo->ack_num = listenSo->seq_num+1;
-
-
-		} else {
-			if (recvSo->state == State::SYN_SENT) { // Client Side
-				if (IS_SET(flag, FLAG_ACK)) { // ACK+SYN Received 
+		}
+		break;
+		case State::SYN_SENT:
+		{
+			if (IS_SET(flag, FLAG_SYN)){ 
+				if (IS_SET(flag, FLAG_ACK)) {// ACK+SYN Received 
 					/*** Client: SYN Received! Connection Established! Send ACK ***/
 					if (VERBOSE) printf("Client: Connection Established!\n");
 
@@ -499,7 +499,12 @@ void TCPAssignment::packetArrived(std::string fromModule, Packet* packet)
 					// recvSo->seq_num++;
 
 				}
-			} else if (recvSo->state == State::SYN_RECV) {
+			}
+		}
+		break;
+		case State::SYN_RECV:
+		{
+			if (IS_SET(flag, FLAG_SYN)){
 				if (IS_SET(flag, FLAG_ACK)) {
 					if (VERBOSE) printf("Simultaneous Open: SYN_RECV -> ESTABLISHED\n");
 					recvSo->state = State::ESTABLISHED; // connection is established
@@ -507,37 +512,42 @@ void TCPAssignment::packetArrived(std::string fromModule, Packet* packet)
 					this->send_ACK_Packet(seq_num+1, recvSo, tcp, myPacket);
 
 					SystemCallInterface::returnSystemCall(recvSo->syscallUUID, 0); // unblock connect() (Simultaneous open)
+				} 
+			} else {
+				if (IS_SET(flag, FLAG_ACK)) { // ACK is Received
+					if (VERBOSE) printf("SERVER: ACK is Received!\n");
+					/**** Connection ESTABLISHED! ****/
+					recvSo->state = State::ESTABLISHED; // connection is established
+					recvSo->is_established = true;
+					listenSo = getListenSocketByContext(tcp->dest_ip, tcp->dest_port);
+					listenSo->backlog--; // update backlog value
+					
+					if (listenSo->temp_addr != NULL) { // accept() is already called
+						memcpy(listenSo->temp_addr, &recvSo->peer_addr, sizeof(struct sockaddr_in));
+						listenSo->temp_addr = NULL;
+						listenSo->pending_queue.pop();
+
+						SystemCallInterface::returnSystemCall(listenSo->syscallUUID, recvSo->fd); // unblock accept()
+					} else {
+						// wait accept();
+					}
 				}
 			}
 		}
-	} else if (recvSo != NULL && recvSo->state == State::SYN_RECV) { // Server Side
-		if (IS_SET(flag, FLAG_ACK)) { // ACK is Received
-			if (VERBOSE) printf("SERVER: ACK is Received!\n");
-			/**** Connection ESTABLISHED! ****/
-			recvSo->state = State::ESTABLISHED; // connection is established
-			recvSo->is_established = true;
-			listenSo->backlog--; // update backlog value
-			
-			if (listenSo->temp_addr != NULL) { // accept() is already called
-				memcpy(listenSo->temp_addr, &recvSo->peer_addr, sizeof(struct sockaddr_in));
-				listenSo->temp_addr = NULL;
-				listenSo->pending_queue.pop();
-
-				SystemCallInterface::returnSystemCall(listenSo->syscallUUID, recvSo->fd); // unblock accept()
-			} else {
-				// wait accept();
-			}
-		}
-	} 
-	if (IS_SET(flag, FLAG_FIN)) { // FIN flag is set 
-		if (recvSo != NULL) {
-			if(recvSo->state == State::ESTABLISHED) { // server
+		break;
+		case State::ESTABLISHED:
+		{
+			if (IS_SET(flag, FLAG_FIN)) {
 				if (VERBOSE) printf("Server %d: ESTABLISHED -> CLOSE_WAIT\n", recvSo->fd);
 				recvSo->state = State::CLOSE_WAIT;
 
 				this->send_ACK_Packet(seq_num+1, recvSo, tcp, myPacket);
-
-			} else if (recvSo->state == State::FIN_WAIT_1) {// client
+			}
+		}
+		break;
+		case State::FIN_WAIT_1:
+		{
+			if (IS_SET(flag, FLAG_FIN)) {
 				if (IS_SET(flag, FLAG_ACK)) { // FIN+ACK
 					if (VERBOSE) printf("Client %d: FIN_WAIT_1 -> TIME_WAIT\n", recvSo->fd);
 					recvSo->state = State::TIME_WAIT;
@@ -552,7 +562,15 @@ void TCPAssignment::packetArrived(std::string fromModule, Packet* packet)
 					recvSo->state = State::CLOSING;
 					//this->send_ACK_Packet(seq_num+1, recvSo, tcp, myPacket);
 				}
-			} else if (recvSo->state == State::FIN_WAIT_2) { // client
+			} else {
+				if (VERBOSE) printf("Client %d: FIN_WAIT_1 -> FIN_WAIT_2\n", recvSo->fd);
+				recvSo->state = State::FIN_WAIT_2;	
+			}
+		}
+		break;
+		case State::FIN_WAIT_2:
+		{
+			if (IS_SET(flag, FLAG_FIN)) {
 				if (VERBOSE) printf("Client %d: FIN_WAIT_2 -> TIME_WAIT\n", recvSo->fd);
 				recvSo->state = State::TIME_WAIT;
 
@@ -563,29 +581,34 @@ void TCPAssignment::packetArrived(std::string fromModule, Packet* packet)
 				TimerModule::addTimer(tp, TimeUtil::makeTime(TCP_TIMEWAIT_LEN, TimeUtil::SEC));
 			}
 		}
-	} else if (IS_SET(flag, FLAG_ACK)) {
-		if (recvSo->state == State::FIN_WAIT_1) { // client
-			if (VERBOSE) printf("Client %d: FIN_WAIT_1 -> FIN_WAIT_2\n", recvSo->fd);
-			recvSo->state = State::FIN_WAIT_2;
-		} else if (recvSo->state == State::LAST_ACK) {
-			if (VERBOSE) printf("Server %d: LAST_ACK -> CLOSED \n", recvSo->fd);
-			recvSo->state = State::CLOSED;
-			
-			// Socket Termination
-			int pid = recvSo->pid;
-			int fd = recvSo->fd;
-			delete this->socket_map[pid][fd];
-			this->socket_map[pid].erase(fd);	
-			SystemCallInterface::removeFileDescriptor(pid, fd);
-		} else if (recvSo->state == State::CLOSING) {
-			if (VERBOSE) printf("Socket %d: CLOSING -> TIME_WAIT\n", recvSo->fd);
-			recvSo->state = State::TIME_WAIT;
+		break;
+		case State::LAST_ACK:
+		{
+			if (IS_SET(flag, FLAG_ACK)) {
+				if (VERBOSE) printf("Server %d: LAST_ACK -> CLOSED \n", recvSo->fd);
+				recvSo->state = State::CLOSED;
+				
+				// Socket Termination
+				int pid = recvSo->pid;
+				int fd = recvSo->fd;
+				delete this->socket_map[pid][fd];
+				this->socket_map[pid].erase(fd);	
+				SystemCallInterface::removeFileDescriptor(pid, fd);
+			}
+		}
+		break;
+		case State::CLOSING:
+		{
+			if (IS_SET(flag, FLAG_ACK)) {
+				if (VERBOSE) printf("Socket %d: CLOSING -> TIME_WAIT\n", recvSo->fd);
+				recvSo->state = State::TIME_WAIT;
 
-			this->send_ACK_Packet(seq_num, recvSo, tcp, myPacket);
+				this->send_ACK_Packet(seq_num, recvSo, tcp, myPacket);
 
-			// TIME_WAIT timeout
-			TimerPayload* tp = new TimerPayload(TIMER::TIME_WAIT, recvSo);
-			TimerModule::addTimer(tp, TimeUtil::makeTime(TCP_TIMEWAIT_LEN, TimeUtil::SEC));
+				// TIME_WAIT timeout
+				TimerPayload* tp = new TimerPayload(TIMER::TIME_WAIT, recvSo);
+				TimerModule::addTimer(tp, TimeUtil::makeTime(TCP_TIMEWAIT_LEN, TimeUtil::SEC));
+			}
 		}
 	}
 	this->freePacket(packet);
