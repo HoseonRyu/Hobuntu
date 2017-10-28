@@ -21,8 +21,10 @@
 #include <E/E_TimerModule.hpp>
 
 #define IP_OFFSET 14
-#define TCP_OFFSET IP_OFFSET+20
+#define TCP_OFFSET 34
 #define PSEUDO_HEADER_LEN 12
+#define TCP_HEADER_LEN 20
+#define TCP_DATA_OFFSET 54
 
 #define LOCAL true
 #define REMOTE false
@@ -32,7 +34,9 @@
 #define FLAG_SYN 0x02
 #define FLAG_FIN 0x01
 
+
 #define TCP_TIMEWAIT_LEN 60
+#define MSS 512
 
 #define IS_SET(flag, test) ((flag & test) != 0)
 
@@ -71,12 +75,12 @@ public:
 	struct sockaddr peer_addr;		// Address information of peer socket
 	bool is_bound;					// true if socket is bound
 	bool is_peer_set;				// true if peer_addr is set
+	bool is_established;			// true if already established
 
 	int state;					// TCP state
 
-	// For Server socket
+	/* For Server socket */
 	bool is_listening;				// true if socket si listening
-	bool is_established;			// true if already established
 	int backlog_max;				// maximum number of backlog value
 	struct sockaddr* temp_addr;		// used for accept() parameter transfer
 
@@ -87,6 +91,32 @@ public:
 	UUID syscallUUID;
 	int seq_num;
 	uint32_t ack_num;
+	uint32_t peer_seq_base;
+
+	/* For Congestion Control */
+	uint16_t cwnd;
+	int sendBase;
+	int dupACKcount;
+
+	/* Read Socket */
+	bool isReading;	// true if read() is called
+	void* read_buf; 	// for read()
+	size_t remainSize;	// for read()
+	int read_count; 	// for read()
+
+	uint32_t recvBase;					// Base of Receiver
+	uint32_t rwnd;						// Window Size of Receiver
+
+	uint8_t read_internalBuffer[MSS];	// buffer for one segment (need for read() with small size)
+	int read_internalSize;				// buffer size for Packet we read before
+	int read_internalIndex; 			// current index for read_internalBuffer
+	
+	std::map<uint32_t, Packet *> readBuffer; 		// Pending Buffer for read(), accpeted from TCP data read();
+	std::map<uint32_t, Packet *> recvWindowBuffer; 	// Buffer for Received Window
+	uint32_t expected_recvSeqNum;					// Expected Receive Sequence number
+
+	/* Write Socket */
+
 
 	SocketObject(){}
 	SocketObject(int pid_, int fd_){
@@ -111,6 +141,18 @@ public:
 		this->is_listening = false;
 		this->backlog_max = 0;
 		this->backlog = 0;
+
+		this->cwnd = MSS; // slow start
+		this->sendBase = 0;
+		this->dupACKcount = 0;
+
+		this->isReading = false;
+		this->recvBase = 0;
+		this->rwnd = 51200;
+		this->recvWindowBuffer = {};
+		this->expected_recvSeqNum = 0;
+
+		this->read_internalIndex = -1;
 	}
 
 	/* helper function of socket addresss 
@@ -128,6 +170,17 @@ public:
 	uint32_t get_ip_address(bool local = true){
 		struct sockaddr *addr = (local) ? &this->local_addr : &this->peer_addr;
 		return ((struct sockaddr_in *)addr)->sin_addr.s_addr;
+	}
+	uint32_t get_boundIP_address(Host* host, bool local = true){
+		struct sockaddr *addr = (local) ? &this->local_addr : &this->peer_addr;
+		uint32_t ip = ((struct sockaddr_in *)addr)->sin_addr.s_addr;
+		if (ip == 0) {
+			uint8_t ip[4];
+			host->getIPAddr(ip, 0);
+			return *(uint32_t *)ip;
+		} else {
+			return ip;
+		}
 	}
 	void set_family(int family, bool local = true){
 		struct sockaddr *addr = (local) ? &this->local_addr : &this->peer_addr;
@@ -166,12 +219,17 @@ public:
 	//uint16_t checksum;
 	uint16_t urgent;
 
+	uint8_t* payload;
+	int payload_size;
+
 	TCPHeader() {
 		init_value();
 		this->header = (uint8_t *)malloc(TCP_OFFSET+20);
 	}
 	TCPHeader(Packet* packet) {
 		this->header = (uint8_t *)malloc(TCP_OFFSET+20);
+		this->payload = NULL;
+		this->payload_size = 0;
 		this->getHeaderFromPacket(packet);
 	}
 	~TCPHeader() {
@@ -190,7 +248,7 @@ public:
 		*(uint16_t *)(header+TCP_OFFSET+14) = this->window_size;
 		*(uint16_t *)(header+TCP_OFFSET+16) = 0x0000; //initial checksum
 		*(uint16_t *)(header+TCP_OFFSET+18) = this->urgent;
-		*(uint16_t *)(header+TCP_OFFSET+16) = this->get_TCPchecksum(header, 20);
+		*(uint16_t *)(header+TCP_OFFSET+16) = this->get_TCPchecksum(header, payload, payload_size);
 		return header;
 	}
 	void swap_ip() {
@@ -228,16 +286,18 @@ private:
 		flag = 0;
 		window_size = 0;
 		urgent = 0;
+		payload = NULL;
+		payload_size = 0;
 	}
 	/* len is length of only TCP Header */
-	unsigned short get_TCPchecksum(uint8_t* header, int len) {
+	unsigned short get_TCPchecksum(uint8_t* header, uint8_t* payload, int payload_size) {
 		// Construct pseudo header
 		uint8_t pseudo_header[PSEUDO_HEADER_LEN]; 
 		memset(pseudo_header, 0, PSEUDO_HEADER_LEN);
 		memcpy(pseudo_header, header+IP_OFFSET+12, 4); // source ip
 		memcpy(pseudo_header+4, header+IP_OFFSET+16, 4); // dest ip
 		pseudo_header[9] = 0x06; // TCP protocol
-		((uint16_t *)pseudo_header)[5] = htons ((uint16_t)len); // length
+		((uint16_t *)pseudo_header)[5] = htons (TCP_HEADER_LEN + payload_size); // length
 
 		// Get sum
 		unsigned int sum = 0;
@@ -246,10 +306,20 @@ private:
 			sum += ((unsigned short *)pseudo_header)[i];
 			sum = (sum + (sum >> 16)) & 0xFFFF;
 		};
-		for (i=0;i<len/2;i++){
+		for (i=0;i<TCP_HEADER_LEN/2;i++){
 			sum += *(unsigned short *)(header+TCP_OFFSET+2*i);
 			sum = (sum + (sum >> 16)) & 0xFFFF;
 		};
+		if (payload != NULL) {
+			for (i=0;i<payload_size/2;i++){
+				sum += *(unsigned short *)(payload+2*i);
+				sum = (sum + (sum >> 16)) & 0xFFFF;
+			};
+			if(payload_size%2 == 1){
+				sum += *(unsigned char *)(payload+payload_size-1);
+				sum = (sum + (sum >> 16)) & 0xFFFF;
+			}
+		}
 		return ~((unsigned short)sum);
 	}
 };
@@ -288,6 +358,9 @@ protected:
 	void syscall_accept(UUID syscallUUID, int pid, int sockfd, struct sockaddr *addr, socklen_t *addrlen);
 	void syscall_getpeername(UUID syscallUUID, int pid, int sockfd, struct sockaddr *addr, socklen_t *addrlen);
 	
+	void syscall_read(UUID syscallUUID, int pid, int sockfd, void *buf, size_t count);
+	void syscall_write(UUID syscallUUID, int pid, int sockfd, const void *buf, size_t count);
+
 	SocketObject* getSocketObject(int pid, int fd);
 	SocketObject* getSocketObjectByContext(uint32_t local_ip, uint16_t local_port, 
 		uint32_t remote_ip, uint16_t remote_port);
@@ -297,6 +370,10 @@ protected:
 	int implicit_bind (int pid, int sockfd);
 
 	void send_ACK_Packet(int ack_num, SocketObject* so, TCPHeader* tcp, Packet* packet);
+
+	void process_received_data(SocketObject* so, TCPHeader* tcp, Packet* packet);
+	void internal_read(SocketObject* so);
+
 };
 
 class TCPAssignmentProvider
