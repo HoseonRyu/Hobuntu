@@ -17,11 +17,19 @@
 #include <E/E_TimeUtil.hpp>
 #include <E/E_TimerModule.hpp>
 #include <arpa/inet.h>
+#include <sys/socket.h>
 #include <map>
 
 #define VERBOSE 0
 #define MAX(a,b) (a>b)?a:b
 #define MIN(a,b) (a>b)?b:a
+#define ABS(a,b) (a>b)?a-b:b-a
+#define currentTime() this->getHost()->getSystem()->getCurrentTime()
+
+#define ALPHA 0.125
+#define BETA 0.25
+#define K 4
+#define InitDevRTT 100000
 
 namespace E
 {
@@ -53,6 +61,7 @@ void TCPAssignment::finalize()
 void TCPAssignment::syscall_socket(UUID syscallUUID, int pid, int protocolFamily, int type, int protocol){
 	int fd = SystemCallInterface::createFileDescriptor(pid);
 	SocketObject *so = new SocketObject(pid, fd);
+	so->devRTT = InitDevRTT;
 // so->domain = protocolFamily;
 // so->type = type;
 // so->protocol = protocol;
@@ -81,6 +90,7 @@ void TCPAssignment::syscall_close(UUID syscallUUID, int pid, int fd){
 		tcp->flag = FLAG_FIN;
 		tcp->window_size = htons(51200);
 
+		so->sent_FIN_seqnum = so->seq_num;
 		Packet* packet = this->allocatePacket(TCP_OFFSET+20);
 		packet->writeData(0, tcp->calculateHeader(), TCP_OFFSET+20);
 		this->sendPacket("IPv4", packet);
@@ -100,7 +110,7 @@ void TCPAssignment::syscall_close(UUID syscallUUID, int pid, int fd){
 	} else {
 		// Socket Termination
 		delete this->socket_map[pid][fd];
-		this->socket_map[pid].erase(fd);	
+		this->socket_map[pid].erase(fd);
 		SystemCallInterface::removeFileDescriptor(pid, fd);
 	}
 	SystemCallInterface::returnSystemCall(syscallUUID, 0);		
@@ -247,7 +257,7 @@ void TCPAssignment::syscall_connect(UUID syscallUUID, int pid, int sockfd, struc
 	tcp->src_port = clientSo->get_port();
 	tcp->dest_port = ((struct sockaddr_in *)serv_addr)->sin_port;
 	
-	tcp->seq_num = htonl(clientSo->seq_num); // Sequence Number
+	tcp->seq_num = htonl(clientSo->local_seq_base); // Sequence Number
 	tcp->ack_num = htonl(0); // ACK Number
 	tcp->offset = 0x50; // Offset
 	tcp->flag = FLAG_SYN; // SYN Flag
@@ -323,14 +333,14 @@ void TCPAssignment::syscall_read(UUID syscallUUID, int pid, int sockfd, void *bu
 
 	so->isReading = true;
 	so->syscallUUID = syscallUUID;
-	so->remainSize = count;
+	so->read_remainSize = count;
 	so->read_buf = buf;
 	so->read_count = 0;
 	internal_read(so);
 }
 
 void TCPAssignment::internal_read(SocketObject* so) {
-	while (so->remainSize > 0) {
+	while (so->read_remainSize > 0) {
 		if (so->read_internalIndex == -1) { // internal Segment Buffer has no data
 			if (so->readBuffer.empty()) { // No Packet Pending 
 				break;	// block read()
@@ -339,37 +349,40 @@ void TCPAssignment::internal_read(SocketObject* so) {
 			/* Read One Segment  */
 			auto iter = so->readBuffer.begin();
 			Packet* recvPacket = iter->second;
-			recvPacket->readData(TCP_DATA_OFFSET, so->read_internalBuffer, recvPacket->getSize() - TCP_DATA_OFFSET); 
+			size_t recvPayloadSize = recvPacket->getSize() - TCP_DATA_OFFSET;
+			recvPacket->readData(TCP_DATA_OFFSET, so->read_internalBuffer, recvPayloadSize); 
 			so->read_internalIndex = 0; // init internal Buffer
-			so->read_internalSize = recvPacket->getSize() - TCP_DATA_OFFSET;
+			so->read_internalSize = recvPayloadSize;
 			
 			so->readBuffer.erase(iter->first); // erase from readBuffer
 			this->freePacket(iter->second);
 		} else { // internal Segment Buffer has data
 			size_t availableSize = so->read_internalSize - so->read_internalIndex;
-			if (so->remainSize <= availableSize){ // internal Buffer has enough data to provide read()
-				if (VERBOSE)
-					printf("Copy index %03d~%03lu\n", so->read_internalIndex, so->read_internalIndex + so->remainSize-1);
-				memcpy(so->read_buf, so->read_internalBuffer+so->read_internalIndex, so->remainSize);
-				so->read_internalIndex += so->remainSize;
-				so->read_count += so->remainSize; 
+			if (so->read_remainSize <= availableSize){ // internal Buffer has enough data to provide read()
+				// if (VERBOSE)
+				// 	printf("Copy index %03d~%03lu\n", so->read_internalIndex, so->read_internalIndex + so->read_remainSize-1);
+				memcpy(so->read_buf, so->read_internalBuffer+so->read_internalIndex, so->read_remainSize);
+				so->read_internalIndex += so->read_remainSize;
+				so->read_count += so->read_remainSize; 
+				so->rwnd += so->read_remainSize;
 
 				/* Reading Complete! */
 				if (so->read_internalIndex == so->read_internalSize) {
 					so->read_internalIndex = -1;
 				}
  				so->isReading = false;
-				so->remainSize = 0;
+				so->read_remainSize = 0;
 				SystemCallInterface::returnSystemCall(so->syscallUUID, so->read_count); // unblock read()
 				break;
 			} else { // internal Buffer has small number of data to provide read()
-				if (VERBOSE)
-					printf("Copy index2 %03d~%03lu\n", so->read_internalIndex, so->read_internalIndex+availableSize-1);
+				// if (VERBOSE)
+				// 	printf("Copy index2 %03d~%03lu\n", so->read_internalIndex, so->read_internalIndex+availableSize-1);
 				memcpy(so->read_buf, so->read_internalBuffer+so->read_internalIndex, availableSize);
 				so->read_internalIndex = -1; // reset internal Buffer
-				so->remainSize -= availableSize;
+				so->read_remainSize -= availableSize;
 				so->read_count += availableSize;
 				so->read_buf = (uint8_t *)so->read_buf + availableSize;
+				so->rwnd += availableSize;
 			}
 		}
 	}
@@ -385,30 +398,112 @@ void TCPAssignment::syscall_write(UUID syscallUUID, int pid, int sockfd, const v
 		SystemCallInterface::returnSystemCall(syscallUUID, -1);
 		return;
 	}
-	int sendCount = MIN(count, MSS);
 
-	TCPHeader *tcp = new TCPHeader();
-	tcp->src_ip = so->get_boundIP_address(this->getHost());
-	tcp->src_port = so->get_port();
-	tcp->dest_ip = so->get_ip_address(REMOTE);
-	tcp->dest_port = so->get_port(REMOTE);
-	tcp->seq_num = htonl(so->seq_num);
-	tcp->ack_num = htonl(1);
-	tcp->offset = 0x50;
-	tcp->window_size = htons(51200);
-	tcp->flag = FLAG_ACK;
-	tcp->payload = (uint8_t *)buf;
-	tcp->payload_size = sendCount;
+	so->isWriting = true;
+	so->write_internalBuffer = malloc(count);
+	memcpy(so->write_internalBuffer, buf, count);
+	so->write_internalIndex = 0;
+	so->write_remainSize = count;
+	so->syscallUUID = syscallUUID;
+	so->write_count = 0;
+	internal_write(so);
+}
 
-	Packet* packet = this->allocatePacket(TCP_OFFSET+20+sendCount);
-	packet->writeData(0, tcp->calculateHeader(), TCP_OFFSET+20);
-	packet->writeData(TCP_OFFSET+20, buf, sendCount);
-	this->sendPacket("IPv4", packet);
-	delete tcp;
-	so->ack_num = so->seq_num+1;
-	so->seq_num += count;
+void TCPAssignment::internal_write(SocketObject* so) {
+	while (so->write_remainSize > 0) {
+		// printf("cwnd: %lAd\n", so->cwnd);
+		size_t availableSize = so->cwnd - so->sendWindowPayloadSize;
 
-	SystemCallInterface::returnSystemCall(syscallUUID, sendCount);
+		if (!so->expectedACKBuffer.empty() && ((uint32_t )so->seq_num < so->expectedACKBuffer.rbegin()->first)) {
+			// During retransmission;
+			// TO DO :: 차례로 다음것을 보내는 코드 만들기. (지금은 맨처음껏만 계속 보냄)
+			struct packet_data *pd = so->expectedACKBuffer[so->seq_num - so->local_seq_base + MSS]; // MSS 아닐때?
+			Packet* packet = pd->packet;
+			size_t writeSize = packet->getSize() - TCP_DATA_OFFSET;
+			if (availableSize >= writeSize) {
+				pd->packet = this->clonePacket(packet);
+				this->sendPacket("IPv4", packet);
+
+				pd->sent_time = currentTime();
+				so->seq_num += writeSize;
+				so->sendWindowPayloadSize += writeSize;
+				if (VERBOSE)
+					printf("Port %hd\tRetransmit with ACK number %u\n", ntohs(so->get_port()), so->seq_num - so->local_seq_base + MSS);
+			} else {
+				break; // block write()
+			}
+		} else {
+			size_t writeSize = MIN(so->write_remainSize, MSS);
+			writeSize = MIN(writeSize, availableSize);
+
+			/* Flow Control */
+			if (so->rwnd_peer == 0) { 
+				writeSize = 1;
+			} else {
+				writeSize = MIN(writeSize, so->rwnd_peer);
+			}
+
+			if (availableSize == 0) { // Buffer is Full
+				break; // block write()
+			} else {
+				// printf("writeSize:%lu\n",writeSize);
+				/* Send Packet with writeSize */
+				TCPHeader *tcp = new TCPHeader();
+				tcp->src_ip = so->get_boundIP_address(this->getHost());
+				tcp->src_port = so->get_port();
+				tcp->dest_ip = so->get_ip_address(REMOTE);
+				tcp->dest_port = so->get_port(REMOTE);
+				tcp->seq_num = htonl(so->seq_num);
+				tcp->ack_num = htonl(so->ack_num);
+				tcp->offset = 0x50;
+				tcp->window_size = htons(51200);
+				tcp->flag = FLAG_ACK;
+				tcp->payload = (uint8_t *) so->write_internalBuffer + so->write_internalIndex;
+				tcp->payload_size = writeSize;
+
+				Packet* packet = this->allocatePacket(TCP_OFFSET+20+writeSize);
+				packet->writeData(0, tcp->calculateHeader(), TCP_OFFSET+20);
+				packet->writeData(TCP_OFFSET+20, (uint8_t *)so->write_internalBuffer + so->write_internalIndex, writeSize);
+				Packet* ACKpacket = this->clonePacket(packet);
+				this->sendPacket("IPv4", packet);
+				delete tcp;
+
+				so->write_internalIndex += writeSize;
+				so->seq_num += writeSize;
+
+
+				// printf("expectedACKBuffer %u inserted\n", so->seq_num - so->local_seq_base);
+				struct packet_data *pd = (struct packet_data *)malloc(sizeof(struct packet_data));
+				memset(pd, 0, sizeof(struct packet_data));
+				pd->packet = ACKpacket;
+				pd->sent_time = this->getHost()->getSystem()->getCurrentTime();
+				so->expectedACKBuffer[so->seq_num - so->local_seq_base] = pd;
+				so->sendWindowPayloadSize += writeSize;
+
+
+				/* Set Timer */
+				if (!so->isTcpTimerRunning) {
+					TimerPayload *tp = new TimerPayload(TIMER::TIME_OUT, so);
+					so->tcpTimer = TimerModule::addTimer(tp, TimeUtil::makeTime(so->timeoutInterval, TimeUtil::USEC));
+					so->isTcpTimerRunning = true;
+					so->tp = tp;
+				}
+				
+				so->write_remainSize -= writeSize;
+				so->write_count += writeSize;
+
+				// printf("*Send expectedACK %u with timeout %u\n", so->seq_num - so->local_seq_base, so->timeoutInterval);
+				/* set up Timer */
+			}
+		}
+		
+	}
+
+	if (so->write_remainSize == 0) {
+		/* Writing Finished */
+		so->isWriting = false;
+		SystemCallInterface::returnSystemCall(so->syscallUUID, so->write_count);
+	}
 }
 
 
@@ -514,11 +609,13 @@ void TCPAssignment::packetArrived(std::string fromModule, Packet* packet)
 					memcpy(&acceptSo->local_addr, &recvSo->local_addr, len); // copy address 
 					acceptSo->state = State::SYN_RECV;
 					acceptSo->is_bound = true;
-					acceptSo->seq_num = recvSo->seq_num+1; // packet will be sent
+					acceptSo->seq_num = recvSo->local_seq_base+1; // packet will be sent
 					acceptSo->ack_num = seq_num+1; // packet will be sent
 					acceptSo->peer_seq_base = ntohl(tcp->seq_num);
 					acceptSo->expected_recvSeqNum = 1;
 					acceptSo->recvBase = 1;
+					acceptSo->sendBase = 1;
+					acceptSo->local_ack_base = seq_num;
 
 
 					// Update peer socket of server socket
@@ -540,7 +637,7 @@ void TCPAssignment::packetArrived(std::string fromModule, Packet* packet)
 				// Packet Management
 				tcp->swap_ip();
 				tcp->swap_port();
-				tcp->seq_num = htonl(recvSo->seq_num); // Sequence Number
+				tcp->seq_num = htonl(recvSo->local_seq_base); // Sequence Number
 				tcp->ack_num = htonl(seq_num+1); // ACK Number
 				if (success)
 					tcp->flag = FLAG_ACK | FLAG_SYN; // SYN, ACK Flag
@@ -557,19 +654,14 @@ void TCPAssignment::packetArrived(std::string fromModule, Packet* packet)
 		{
 			if (IS_SET(flag, FLAG_SYN)){ 
 				if (IS_SET(flag, FLAG_ACK)) {// ACK+SYN Received 
-					/*** Client: SYN Received! Connection Established! Send ACK ***/
+					/*** Client: SYN+ACK Received! Connection Established! Send ACK ***/
 					if (VERBOSE) printf("Client: Connection Established!\n");
-
 					/**** Connection ESTABLISHED! ****/
-					// Update peer socket of client socket
-					recvSo->state = State::ESTABLISHED; 
-					recvSo->is_established = true;
-					recvSo->peer_seq_base = ntohl(tcp->seq_num);
-					recvSo->expected_recvSeqNum = 1;
-					recvSo->recvBase = 1;
+					this->initializeSocketEstablished(recvSo, tcp);
 						
 					// Packet Management
 					this->send_ACK_Packet(seq_num+1, recvSo, tcp, myPacket);
+					recvSo->local_ack_base = seq_num;
 					SystemCallInterface::returnSystemCall(recvSo->syscallUUID, 0); // unblock connect()
 				} else { // Only SYN Received (Simultaneous Open)
 					if (VERBOSE) printf("Simultaneous Open: SYN_SENT -> SYN_RECV\n");
@@ -594,23 +686,17 @@ void TCPAssignment::packetArrived(std::string fromModule, Packet* packet)
 			if (IS_SET(flag, FLAG_SYN)){
 				if (IS_SET(flag, FLAG_ACK)) {
 					if (VERBOSE) printf("Simultaneous Open: SYN_RECV -> ESTABLISHED\n");
-					recvSo->state = State::ESTABLISHED; // connection is established
-					recvSo->is_established = true;
-					recvSo->peer_seq_base = ntohl(tcp->seq_num);
-					recvSo->expected_recvSeqNum = 1;
-					recvSo->recvBase = 1;
+					/**** Connection ESTABLISHED! ****/
+					this->initializeSocketEstablished(recvSo, tcp);
 					this->send_ACK_Packet(seq_num+1, recvSo, tcp, myPacket);
-
 					SystemCallInterface::returnSystemCall(recvSo->syscallUUID, 0); // unblock connect() (Simultaneous open)
 				} 
 			} else {
 				if (IS_SET(flag, FLAG_ACK)) { // ACK is Received
 					if (VERBOSE) printf("SERVER: ACK is Received!\n");
 					/**** Connection ESTABLISHED! ****/
-					recvSo->state = State::ESTABLISHED; // connection is established
-					recvSo->is_established = true;
-					recvSo->expected_recvSeqNum = 1;
-					recvSo->recvBase = 1;
+					this->initializeSocketEstablished(recvSo, tcp);
+					recvSo->peer_seq_base -= 1; // Current Sequnce Number is 1.
 					listenSo = getListenSocketByContext(tcp->dest_ip, tcp->dest_port);
 					listenSo->backlog--; // update backlog value
 					
@@ -643,23 +729,33 @@ void TCPAssignment::packetArrived(std::string fromModule, Packet* packet)
 		{
 			if (IS_SET(flag, FLAG_FIN)) {
 				if (IS_SET(flag, FLAG_ACK)) { // FIN+ACK
-					if (VERBOSE) printf("Client %d: FIN_WAIT_1 -> TIME_WAIT\n", recvSo->fd);
-					recvSo->state = State::TIME_WAIT;
+					if (ntohl(tcp->ack_num) == recvSo->sent_FIN_seqnum + 1) { // ACK for FIN pacekt
+						if (VERBOSE) printf("Client %d: FIN_WAIT_1 -> TIME_WAIT\n", recvSo->fd);
+						recvSo->state = State::TIME_WAIT;
 
-					this->send_ACK_Packet(seq_num+1, recvSo, tcp, myPacket);
+						this->send_ACK_Packet(seq_num+1, recvSo, tcp, myPacket);
 
-					// TIME_WAIT timeout
-					TimerPayload* tp = new TimerPayload(TIMER::TIME_WAIT, recvSo);
-					TimerModule::addTimer(tp, TimeUtil::makeTime(TCP_TIMEWAIT_LEN, TimeUtil::SEC));
+						// TIME_WAIT timeout
+						TimerPayload* tp = new TimerPayload(TIMER::TIME_WAIT, recvSo);
+						TimerModule::addTimer(tp, TimeUtil::makeTime(TCP_TIMEWAIT_LEN, TimeUtil::SEC));
+					} else {
+						process_received_data(recvSo, tcp, myPacket);
+					}
 				} else {
 					if (VERBOSE) printf("Client %d: FIN_WAIT_1 -> CLOSING\n", recvSo->fd);
 					recvSo->state = State::CLOSING;
 					//this->send_ACK_Packet(seq_num+1, recvSo, tcp, myPacket);
 				}
 			} else {
-				if (VERBOSE) printf("Client %d: FIN_WAIT_1 -> FIN_WAIT_2\n", recvSo->fd);
-				recvSo->state = State::FIN_WAIT_2;	
-			}
+				if (IS_SET(flag, FLAG_ACK)) { // ACK
+					if (ntohl(tcp->ack_num) == recvSo->sent_FIN_seqnum + 1) { // ACK for FIN pacekt
+						if (VERBOSE) printf("Client %d: FIN_WAIT_1 -> FIN_WAIT_2\n", recvSo->fd);
+						recvSo->state = State::FIN_WAIT_2;	
+					} else {
+						process_received_data(recvSo, tcp, myPacket);
+					}
+				} 
+			} 
 		}
 		break;
 		case State::FIN_WAIT_2:
@@ -673,6 +769,8 @@ void TCPAssignment::packetArrived(std::string fromModule, Packet* packet)
 				// TIME_WAIT timeout
 				TimerPayload* tp = new TimerPayload(TIMER::TIME_WAIT, recvSo);
 				TimerModule::addTimer(tp, TimeUtil::makeTime(TCP_TIMEWAIT_LEN, TimeUtil::SEC));
+			} else {
+				this->process_received_data(recvSo, tcp, myPacket);
 			}
 		}
 		break;
@@ -709,42 +807,196 @@ void TCPAssignment::packetArrived(std::string fromModule, Packet* packet)
 	delete tcp;
 }
 
+void TCPAssignment::initializeSocketEstablished(SocketObject* so, TCPHeader* tcp){
+	so->state = State::ESTABLISHED; 
+	so->is_established = true;
+	so->peer_seq_base = ntohl(tcp->seq_num);
+	so->expected_recvSeqNum = 1;
+	so->recvBase = 1;
+	so->sendBase = 1;
+}
+
 void TCPAssignment::timerCallback(void* payload)
 {
 	TimerPayload* tp = (TimerPayload* )payload;
 	SocketObject *targetSo = tp->so;
 
-	if (tp->type == TIMER::TIME_WAIT) {
-		/* Socket Termination */
-		int pid = targetSo->pid;
-		int fd = targetSo->fd;
-		delete this->socket_map[pid][fd];
-		this->socket_map[pid].erase(fd);
-		if (VERBOSE) printf("Socket %d Terminated\n", fd);
+	switch (tp->type) {
+		case TIMER::TIME_WAIT:
+		{
+			int pid = targetSo->pid;
+			int fd = targetSo->fd;
+			delete this->socket_map[pid][fd];
+			this->socket_map[pid].erase(fd);
+			if (VERBOSE) printf("Socket %d Terminated\n", fd);
+			delete tp;	
+		}
+		break;
+		case TIMER::TIME_OUT:
+		{
+			targetSo->tcpTimer = false;
+			if (targetSo->cwnd == MSS) {
+				targetSo->sshthresh = MSS;
+			} else {
+				targetSo->sshthresh = targetSo->cwnd / 2;
+			}
+			targetSo->cwnd = MSS; // Return Slow start
+			targetSo->dupACKcount = 0;
+			targetSo->sendWindowPayloadSize = 0;
+
+			/* retransmit oldest unacked packet */
+			if (targetSo->state == State::ESTABLISHED) {
+				if (!targetSo->expectedACKBuffer.empty()) {
+					auto oldestBuffer = targetSo->expectedACKBuffer.begin();
+					uint32_t expectedACKnum = oldestBuffer->first;
+					struct packet_data *pd = oldestBuffer->second;
+					Packet* packet = pd->packet;
+					pd->packet = this->clonePacket(packet);
+					this->sendPacket("IPv4", packet);
+					targetSo->sendWindowPayloadSize += packet->getSize() - TCP_DATA_OFFSET;
+					if (VERBOSE) {
+						printf("========TIMEOUT==========\n");
+						printf("Port %hd\t Retransmit pacekt with expectedACK %u\n", ntohs(targetSo->get_port()), expectedACKnum);
+					}
+					// MSS 안될때?
+
+					/* start Timer */
+					pd->sent_time = currentTime();
+					targetSo->tcpTimer = TimerModule::addTimer(tp, TimeUtil::makeTime(targetSo->timeoutInterval, TimeUtil::USEC));
+					targetSo->isTcpTimerRunning = true;
+					targetSo->seq_num = expectedACKnum;
+				}
+
+			}
+			// 연속해서 계속 다시 received된 segment도 보내는 문제?
+
+			
+			// printf("%lu elements\n", targetSo->expectedACKBuffer.size());
+		}
+		break;
 	}
-	delete tp;
 }
 
 void TCPAssignment::process_received_data(SocketObject* so, TCPHeader* tcp, Packet* packet) {
 	uint32_t recvSeqNum = ntohl(tcp->seq_num) - so->peer_seq_base;
 	uint32_t recvDataLength = packet->getSize()- TCP_DATA_OFFSET;
-	// printf("Received Seq:%u\tExpected:%u\n",recvSeqNum,so->expected_recvSeqNum);
+	int flag = tcp->flag;
+	// printf("Received Seq:%u\tExpected Seq:%u\n",recvSeqNum, so->expected_recvSeqNum);
 
-	if (recvSeqNum < so->recvBase + so->rwnd) {
-		if (recvSeqNum == so->expected_recvSeqNum){ // correct data with correct order
-			so->expected_recvSeqNum += recvDataLength;
-			so->recvBase += recvDataLength;
-			so->readBuffer[recvSeqNum] = packet;	// insert Read Buffer
+	if (IS_SET(flag, FLAG_ACK)) {
+		uint32_t recvACKNum = ntohl(tcp->ack_num) - so->local_seq_base;
+		so->rwnd_peer = ntohs(tcp->window_size); // update peer's window size
 
-			if (so->isReading){
-				internal_read(so);
+		if (so->expectedACKBuffer.count(recvACKNum) == 1) { // acceptable ACK received
+			if (so->receivedACKBuffer.count(recvACKNum) == 1) {
+				so->dupACKcount++;
+				printf("Dup ACK!\n");
+			} else {
+				so->dupACKcount = 0;
+			}
+			/* Calculate RTT and Timeout Value */
+			struct packet_data *recvPd = so->expectedACKBuffer[recvACKNum];
+
+			uint32_t sampleRTT = TimeUtil::getTime(this->getHost()->getSystem()->getCurrentTime() - recvPd->sent_time, TimeUtil::USEC);
+			so->estimatedRTT = (1 - ALPHA) * so->estimatedRTT + ALPHA * sampleRTT;
+			if(VERBOSE)
+				printf("Port: %hd\tACK   %u   RTT:   %u    Time:    %lu\n", ntohs(so->get_port()), recvACKNum, sampleRTT, currentTime()/1000);
+			so->devRTT = (1 - BETA)*so->devRTT + BETA * ABS(sampleRTT, so->estimatedRTT);
+			so->timeoutInterval = so->estimatedRTT + K * 10000;
+
+			// printf("timeoutInterval%u\n",so->timeoutInterval);  
+			if(VERBOSE) printf("congestionPacketSize:%u\n", so->congestionPacketSize);
+
+			so->receivedACKBuffer[recvACKNum] = packet;
+			if (VERBOSE) this->map_dump(so->expectedACKBuffer, "expectedACKBuffer");
+			if (VERBOSE) this->map_dump(so->receivedACKBuffer, "receivedACKBuffer");
+			
+			while (!so->receivedACKBuffer.empty()) {
+				auto received = so->receivedACKBuffer.begin();
+				auto expected = so->expectedACKBuffer.begin();
+				if (expected->first > received->first) {
+					break; // wait first expected ACK
+				}
+				struct packet_data *pd = expected->second;
+				so->sendBase = expected->first;	// Move sendBase
+				if (so->seq_num - so->local_seq_base < so->sendBase) {
+					so->seq_num = so->sendBase + so->local_seq_base;
+				}
+				
+				/* Delete Packet from Buffer */ 
+				so->congestionPacketSize -= pd->packet->getSize() - TCP_DATA_OFFSET;
+				this->freePacket(expected->second->packet);
+				free(pd);
+				
+				// Free resource
+				// printf("============expectd first: %u, received first:%u\n",expected->first, received->first);
+				if (expected->first == received->first) {
+					so->receivedACKBuffer.erase(received);
+					this->freePacket(received->second);
+				}
+				so->expectedACKBuffer.erase(expected);
+			}
+			/* Congestion control */
+			if (so->congestionPacketSize == 0) {
+				if (so->cwnd < so->sshthresh) {
+					so->cwnd *= 2;	// Slow Start 
+				} else {
+					so->cwnd += MSS; // Congestion Avoidance
+				}
+				so->congestionPacketSize =  so->cwnd;
+				so->sendWindowPayloadSize = 0;
 			}
 
-			Packet* ackPacket = this->allocatePacket(TCP_OFFSET+20);
-			send_ACK_Packet(so->ack_num+recvDataLength, so, tcp, ackPacket); // 여기에 남은 window size 보내기
-		} else { // wrong order
-			/* 여기에 recvBuffer 추가하는 코드 추가 */
-		}	
+			/* Timer Management */
+			if (so->isTcpTimerRunning) {
+				TimerModule::cancelTimer(so->tcpTimer);
+				so->isTcpTimerRunning = false;
+				free(so->tp);
+			}
+			if (!so->expectedACKBuffer.empty()) { // if unacked Packet exist
+				TimerPayload *tp = new TimerPayload(TIMER::TIME_OUT, so);
+				so->tcpTimer = TimerModule::addTimer(tp, TimeUtil::makeTime(so->timeoutInterval, TimeUtil::USEC));
+				so->isTcpTimerRunning = true;
+			}
+
+			if (so->isWriting) {
+				internal_write(so);
+			}
+
+		}
+
+		if (recvDataLength > 0) { // if packet has payload
+			if (recvSeqNum < so->recvBase + so->rwnd) {
+				/* insert Window Buffer */
+				so->recvWindowBuffer[recvSeqNum] = packet;
+				so->rwnd -= recvDataLength;
+				
+				/* Send ACK Packet */
+				Packet* ackPacket = this->allocatePacket(TCP_OFFSET+20);
+				tcp->window_size = htons(so->rwnd);
+				if (recvSeqNum == so->expected_recvSeqNum){ // correct data with correct order
+					send_ACK_Packet(so->ack_num+recvDataLength, so, tcp, ackPacket);
+				} else {
+					send_ACK_Packet(so->ack_num, so, tcp, ackPacket); 
+				}
+
+				/* Process if well-ordered sequence exits */
+				while (!so->recvWindowBuffer.empty()) {
+					auto received = so->recvWindowBuffer.begin();
+					if (so->expected_recvSeqNum != received->first) {
+						break; // wait until correct ordered sequence packet
+					}
+
+					so->expected_recvSeqNum += recvDataLength;
+					so->recvBase += recvDataLength;
+					so->readBuffer[recvSeqNum] = packet;	// insert Read Buffer
+					so->recvWindowBuffer.erase(recvSeqNum);
+				}
+				if (so->isReading){
+					internal_read(so);
+				}
+			}
+		}
 	}
 }
 
@@ -812,8 +1064,25 @@ SocketObject* TCPAssignment::getListenSocketByContext(uint32_t local_ip, uint16_
 	return NULL; // Not Found;  	
 }
 
+void TCPAssignment::map_dump (std::map<uint32_t, Packet *> m, const char* name){
+	printf("%s: [", name);
+	for (auto &kv : m) {
+		printf("%u, " ,kv.first);
+	}
+	printf("]\n");
 }
 
-/* TO DO List
+void TCPAssignment::map_dump (std::map<uint32_t, struct packet_data *> m, const char* name){
+	printf("%s: [", name);
+	for (auto &kv : m) {
+		printf("%u, " ,kv.first);
+	}
+	printf("]\n");
+}
+
+}
+
+/* TO DO List,
 	client -- RST 받았을때 구현
+	Timeout 되었을때 buffer 에 남은 것들 어찌 해야하는지?
 	*/

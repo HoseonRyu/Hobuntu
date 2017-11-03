@@ -62,9 +62,13 @@ namespace State {
 /* Used by Timer callback */
 namespace TIMER {
 	enum Enum { 
-		TIME_WAIT
+		TIME_WAIT,
+		TIME_OUT
 	};
 }
+
+class TimerPayload;
+
 /* SocketObject that represents each socket status */
 class SocketObject {
 public:
@@ -89,23 +93,23 @@ public:
 
 	// For Internel Data transfer
 	UUID syscallUUID;
-	int seq_num;
+	uint32_t seq_num;
 	uint32_t ack_num;
 	uint32_t peer_seq_base;
-
-	/* For Congestion Control */
-	uint16_t cwnd;
-	int sendBase;
-	int dupACKcount;
+	uint32_t local_seq_base;
+	uint32_t local_ack_base;
+	uint32_t sent_FIN_seqnum;
+	
 
 	/* Read Socket */
-	bool isReading;	// true if read() is called
-	void* read_buf; 	// for read()
-	size_t remainSize;	// for read()
-	int read_count; 	// for read()
+	bool isReading;			// true if read() is called
+	void* read_buf; 		// for read()
+	size_t read_remainSize;	// for read()
+	int read_count; 		// for read()
 
 	uint32_t recvBase;					// Base of Receiver
-	uint32_t rwnd;						// Window Size of Receiver
+	uint16_t rwnd;						// Window Size of Receiver
+	uint16_t rwnd_peer;					// Window Size of Peer
 
 	uint8_t read_internalBuffer[MSS];	// buffer for one segment (need for read() with small size)
 	int read_internalSize;				// buffer size for Packet we read before
@@ -113,9 +117,34 @@ public:
 	
 	std::map<uint32_t, Packet *> readBuffer; 		// Pending Buffer for read(), accpeted from TCP data read();
 	std::map<uint32_t, Packet *> recvWindowBuffer; 	// Buffer for Received Window
+
 	uint32_t expected_recvSeqNum;					// Expected Receive Sequence number
 
 	/* Write Socket */
+	bool isWriting;				// true if write() is called
+	void* write_internalBuffer;		// for write()
+	int write_internalIndex;		// for write()
+	size_t write_remainSize;	// for write()
+	int write_count;			// for write()
+
+	uint32_t sendBase;
+	uint32_t cwnd;
+	int sendWindowPayloadSize;		// size of pending byte in sendWindowBuffer
+	// std::map<uint32_t, Packet *> sendWindowBuffer;	// Buffer for Sender Window
+	std::map<uint32_t, struct packet_data *> expectedACKBuffer;	// Buffer for expected ACK after sending
+	std::map<uint32_t, Packet *> receivedACKBuffer; // Buffer for recevied ACK after sending
+
+	/* Congestion Control */
+	uint32_t estimatedRTT;
+	uint32_t devRTT;
+	uint32_t timeoutInterval;
+	uint32_t sshthresh;
+	int dupACKcount;
+	uint32_t congestionPacketSize;		// if 0, resize cwnd and send new pacekt
+
+	UUID tcpTimer;
+	bool isTcpTimerRunning;
+	TimerPayload* tp;
 
 
 	SocketObject(){}
@@ -149,10 +178,25 @@ public:
 		this->isReading = false;
 		this->recvBase = 0;
 		this->rwnd = 51200;
+		this->rwnd_peer = 51200;
 		this->recvWindowBuffer = {};
 		this->expected_recvSeqNum = 0;
 
 		this->read_internalIndex = -1;
+		this->local_seq_base = 0;
+
+		this->isWriting = false;
+		this->write_count = 0;
+		this->sendWindowPayloadSize = 0;
+
+		this->estimatedRTT = 40000;		// 40ms * 1000
+		this->devRTT = 0;
+		this->timeoutInterval = 100000;	// 100ms * 1000
+
+		this->isTcpTimerRunning = false;
+		this->sshthresh = -1;	// 64KB (=128MSS)
+		this->congestionPacketSize = this->cwnd;
+
 	}
 
 	/* helper function of socket addresss 
@@ -328,10 +372,19 @@ class TimerPayload {
 public: 
 	int type;
 	SocketObject* so;
-	TimerPayload(int type_, SocketObject* so_){
+	uint32_t sentSeqNum;
+	uint32_t expectedACKNum;
+	TimerPayload(int type_, SocketObject* so_, uint32_t sentSeqNum_ = 0, uint32_t expectedACKNum_ = 0){
 		this->type = type_;
 		this->so = so_;
+		this->sentSeqNum = sentSeqNum_;
+		this->expectedACKNum = expectedACKNum_;
 	}
+};
+
+struct packet_data {
+	Packet* packet;
+	Time sent_time;
 };
 
 class TCPAssignment : public HostModule, public NetworkModule, public SystemCallInterface, private NetworkLog, private TimerModule
@@ -367,12 +420,16 @@ protected:
 	SocketObject* getListenSocketByContext(uint32_t local_ip, uint16_t local_port);
 	bool is_binding_overlap (SocketObject *so1, SocketObject *so2);
 	void hex_dump(void* buf, int ofs, int size);
+	void map_dump(std::map<uint32_t, struct packet_data *> m, const char* name);
+	void map_dump(std::map<uint32_t, Packet *> m, const char* name);
 	int implicit_bind (int pid, int sockfd);
+	void initializeSocketEstablished(SocketObject* so, TCPHeader* tcp);
 
 	void send_ACK_Packet(int ack_num, SocketObject* so, TCPHeader* tcp, Packet* packet);
 
 	void process_received_data(SocketObject* so, TCPHeader* tcp, Packet* packet);
 	void internal_read(SocketObject* so);
+	void internal_write(SocketObject* so);
 
 };
 
