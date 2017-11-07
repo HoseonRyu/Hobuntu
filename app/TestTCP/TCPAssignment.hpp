@@ -59,6 +59,14 @@ namespace State {
 	};
 }
 
+namespace Congestion {
+	enum Enum {
+		SlowStart,
+		Avoidance,
+		FastRecovery
+	};
+}
+
 /* Used by Timer callback */
 namespace TIMER {
 	enum Enum { 
@@ -82,6 +90,7 @@ public:
 	bool is_established;			// true if already established
 
 	int state;					// TCP state
+	int congestionState;		// TCP congestion state
 
 	/* For Server socket */
 	bool is_listening;				// true if socket si listening
@@ -124,7 +133,7 @@ public:
 	bool isWriting;				// true if write() is called
 	void* write_internalBuffer;		// for write()
 	int write_internalIndex;		// for write()
-	size_t write_remainSize;	// for write()
+	int write_remainSize;	// for write()
 	int write_count;			// for write()
 
 	uint32_t sendBase;
@@ -140,11 +149,12 @@ public:
 	uint32_t timeoutInterval;
 	uint32_t sshthresh;
 	int dupACKcount;
-	uint32_t congestionPacketSize;		// if 0, resize cwnd and send new pacekt
+	int congestionPacketSize;		// if 0, resize cwnd and send new pacekt
 
 	UUID tcpTimer;
 	bool isTcpTimerRunning;
 	TimerPayload* tp;
+	uint32_t nextACKNum;
 
 
 	SocketObject(){}
@@ -196,6 +206,9 @@ public:
 		this->isTcpTimerRunning = false;
 		this->sshthresh = -1;	// 64KB (=128MSS)
 		this->congestionPacketSize = this->cwnd;
+
+		this->syscallUUID = 0;
+		this->congestionState = Congestion::SlowStart;
 
 	}
 
@@ -372,13 +385,9 @@ class TimerPayload {
 public: 
 	int type;
 	SocketObject* so;
-	uint32_t sentSeqNum;
-	uint32_t expectedACKNum;
-	TimerPayload(int type_, SocketObject* so_, uint32_t sentSeqNum_ = 0, uint32_t expectedACKNum_ = 0){
+	TimerPayload(int type_, SocketObject* so_){
 		this->type = type_;
 		this->so = so_;
-		this->sentSeqNum = sentSeqNum_;
-		this->expectedACKNum = expectedACKNum_;
 	}
 };
 
@@ -430,6 +439,10 @@ protected:
 	void process_received_data(SocketObject* so, TCPHeader* tcp, Packet* packet);
 	void internal_read(SocketObject* so);
 	void internal_write(SocketObject* so);
+	void retransmitMissingSegment(SocketObject* so, bool resetTimer);
+	void startTimer(SocketObject* so, TimerPayload* tp);
+	void cancelTimer(SocketObject* so);
+	void printPort(SocketObject* so);
 
 };
 

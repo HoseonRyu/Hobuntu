@@ -390,6 +390,7 @@ void TCPAssignment::internal_read(SocketObject* so) {
 
 void TCPAssignment::syscall_write(UUID syscallUUID, int pid, int sockfd, const void *buf, size_t count) {
 	SocketObject* so;
+
 	if((so = TCPAssignment::getSocketObject(pid, sockfd)) == NULL) { // socket is invalid
 		SystemCallInterface::returnSystemCall(syscallUUID, -1);
 		return;
@@ -502,7 +503,8 @@ void TCPAssignment::internal_write(SocketObject* so) {
 	if (so->write_remainSize == 0) {
 		/* Writing Finished */
 		so->isWriting = false;
-		SystemCallInterface::returnSystemCall(so->syscallUUID, so->write_count);
+		free(so->write_internalBuffer);
+		SystemCallInterface::returnSystemCall(so->syscallUUID, so->write_count); // unblock write()
 	}
 }
 
@@ -843,9 +845,10 @@ void TCPAssignment::timerCallback(void* payload)
 			targetSo->cwnd = MSS; // Return Slow start
 			targetSo->dupACKcount = 0;
 			targetSo->sendWindowPayloadSize = 0;
+			targetSo->congestionState = Congestion::SlowStart;
 
 			/* retransmit oldest unacked packet */
-			if (targetSo->state == State::ESTABLISHED) {
+			if (targetSo->state == State::ESTABLISHED || targetSo->state == State::FIN_WAIT_1) {
 				if (!targetSo->expectedACKBuffer.empty()) {
 					auto oldestBuffer = targetSo->expectedACKBuffer.begin();
 					uint32_t expectedACKnum = oldestBuffer->first;
@@ -854,10 +857,14 @@ void TCPAssignment::timerCallback(void* payload)
 					pd->packet = this->clonePacket(packet);
 					this->sendPacket("IPv4", packet);
 					targetSo->sendWindowPayloadSize += packet->getSize() - TCP_DATA_OFFSET;
+					targetSo->congestionPacketSize = targetSo->cwnd;
+
 					if (VERBOSE) {
 						printf("========TIMEOUT==========\n");
-						printf("Port %hd\t Retransmit pacekt with expectedACK %u\n", ntohs(targetSo->get_port()), expectedACKnum);
+						printPort(targetSo);
+						printf("Retransmit pacekt with expectedACK %u\n", expectedACKnum);
 					}
+
 					// MSS 안될때?
 
 					/* start Timer */
@@ -886,30 +893,28 @@ void TCPAssignment::process_received_data(SocketObject* so, TCPHeader* tcp, Pack
 	if (IS_SET(flag, FLAG_ACK)) {
 		uint32_t recvACKNum = ntohl(tcp->ack_num) - so->local_seq_base;
 		so->rwnd_peer = ntohs(tcp->window_size); // update peer's window size
+		if (so->receivedACKBuffer.count(recvACKNum) == 1) {
+			so->dupACKcount++;
+			printf("Dup ACK!\n");
+		} else {
+			so->dupACKcount = 0;
+		}
 
 		if (so->expectedACKBuffer.count(recvACKNum) == 1) { // acceptable ACK received
-			if (so->receivedACKBuffer.count(recvACKNum) == 1) {
-				so->dupACKcount++;
-				printf("Dup ACK!\n");
-			} else {
-				so->dupACKcount = 0;
-			}
 			/* Calculate RTT and Timeout Value */
 			struct packet_data *recvPd = so->expectedACKBuffer[recvACKNum];
 
 			uint32_t sampleRTT = TimeUtil::getTime(this->getHost()->getSystem()->getCurrentTime() - recvPd->sent_time, TimeUtil::USEC);
 			so->estimatedRTT = (1 - ALPHA) * so->estimatedRTT + ALPHA * sampleRTT;
-			if(VERBOSE)
-				printf("Port: %hd\tACK   %u   RTT:   %u    Time:    %lu\n", ntohs(so->get_port()), recvACKNum, sampleRTT, currentTime()/1000);
+			// if(VERBOSE)
+			// 	printf("Port: %hd\tACK   %u   RTT:   %u    Time:    %lu\n", ntohs(so->get_port()), recvACKNum, sampleRTT, currentTime()/1000);
 			so->devRTT = (1 - BETA)*so->devRTT + BETA * ABS(sampleRTT, so->estimatedRTT);
 			so->timeoutInterval = so->estimatedRTT + K * 10000;
 
 			// printf("timeoutInterval%u\n",so->timeoutInterval);  
-			if(VERBOSE) printf("congestionPacketSize:%u\n", so->congestionPacketSize);
+			// if(VERBOSE) printf("congestionPacketSize:%u\n", so->congestionPacketSize);
 
 			so->receivedACKBuffer[recvACKNum] = packet;
-			if (VERBOSE) this->map_dump(so->expectedACKBuffer, "expectedACKBuffer");
-			if (VERBOSE) this->map_dump(so->receivedACKBuffer, "receivedACKBuffer");
 			
 			while (!so->receivedACKBuffer.empty()) {
 				auto received = so->receivedACKBuffer.begin();
@@ -922,9 +927,13 @@ void TCPAssignment::process_received_data(SocketObject* so, TCPHeader* tcp, Pack
 				if (so->seq_num - so->local_seq_base < so->sendBase) {
 					so->seq_num = so->sendBase + so->local_seq_base;
 				}
+				uint32_t successPayloadSize = pd->packet->getSize() - TCP_DATA_OFFSET;
 				
 				/* Delete Packet from Buffer */ 
-				so->congestionPacketSize -= pd->packet->getSize() - TCP_DATA_OFFSET;
+				if (so->congestionState == Congestion::SlowStart) 
+					so->sendWindowPayloadSize -= successPayloadSize;
+				else
+					so->congestionPacketSize -= successPayloadSize;	
 				this->freePacket(expected->second->packet);
 				free(pd);
 				
@@ -935,23 +944,41 @@ void TCPAssignment::process_received_data(SocketObject* so, TCPHeader* tcp, Pack
 					this->freePacket(received->second);
 				}
 				so->expectedACKBuffer.erase(expected);
-			}
+			}	
+
+
 			/* Congestion control */
-			if (so->congestionPacketSize == 0) {
-				if (so->cwnd < so->sshthresh) {
-					so->cwnd *= 2;	// Slow Start 
-				} else {
-					so->cwnd += MSS; // Congestion Avoidance
+			switch (so->congestionState) {
+				case Congestion::SlowStart:
+				{
+					so->cwnd += MSS;		// +MSS for every ACK
+					if (so->cwnd > so->sshthresh) {
+					if (VERBOSE) {
+						printPort(so);
+						printf("Transition: SlowStart -> CA\n");
+					}
+						so->congestionState = Congestion::Avoidance; // state Transition
+						so->congestionPacketSize = so->cwnd;
+					} 
 				}
-				so->congestionPacketSize =  so->cwnd;
-				so->sendWindowPayloadSize = 0;
+				break;
+				case Congestion::Avoidance:
+				{
+					if (so->congestionPacketSize <= 0) { // one RTT is finished
+						so->cwnd += MSS; // +MSS for RTT
+						so->sendWindowPayloadSize = 0;	// write can send data
+						so->congestionPacketSize =  so->cwnd;
+					} 
+				}
+				break;
 			}
+
 
 			/* Timer Management */
 			if (so->isTcpTimerRunning) {
 				TimerModule::cancelTimer(so->tcpTimer);
 				so->isTcpTimerRunning = false;
-				free(so->tp);
+				delete so->tp;
 			}
 			if (!so->expectedACKBuffer.empty()) { // if unacked Packet exist
 				TimerPayload *tp = new TimerPayload(TIMER::TIME_OUT, so);
@@ -1080,7 +1107,13 @@ void TCPAssignment::map_dump (std::map<uint32_t, struct packet_data *> m, const 
 	printf("]\n");
 }
 
+void TCPAssignment::printPort(SocketObject* so){
+	printf("Port %hu\t", ntohs(so->get_port()));
 }
+
+}
+
+
 
 /* TO DO List,
 	client -- RST 받았을때 구현
