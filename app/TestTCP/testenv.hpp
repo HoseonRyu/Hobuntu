@@ -264,17 +264,17 @@ protected:
 	{
 		prev_log = NetworkLog::defaultLevel;
 		NetworkLog::defaultLevel |= (
-				//(1 << NetworkLog::SYSCALL_RAISED) |
-				//(1 << NetworkLog::SYSCALL_FINISHED) |
-				//(1 << NetworkLog::PACKET_ALLOC) |
-				//(1 << NetworkLog::PACKET_CLONE) |
-				//(1 << NetworkLog::PACKET_FREE) |
-				//(1 << NetworkLog::PACKET_TO_MODULE) |
-				//(1 << NetworkLog::PACKET_FROM_MODULE) |
-				//(1 << NetworkLog::PACKET_TO_HOST) |
-				//(1 << NetworkLog::PACKET_FROM_HOST) |
-				//(1 << NetworkLog::PACKET_QUEUE) |
-				//(1 << NetworkLog::TCP_LOG) |
+				// (1 << NetworkLog::SYSCALL_RAISED) |
+				// (1 << NetworkLog::SYSCALL_FINISHED) |
+				// (1 << NetworkLog::PACKET_ALLOC) |
+				// (1 << NetworkLog::PACKET_CLONE) |
+				// (1 << NetworkLog::PACKET_FREE) |
+				// (1 << NetworkLog::PACKET_TO_MODULE) |
+				// (1 << NetworkLog::PACKET_FROM_MODULE) |
+				// (1 << NetworkLog::PACKET_TO_HOST) |
+				// (1 << NetworkLog::PACKET_FROM_HOST) |
+				// (1 << NetworkLog::PACKET_QUEUE) |
+				// (1 << NetworkLog::TCP_LOG) |
 				0UL
 		);
 

@@ -417,7 +417,6 @@ void TCPAssignment::internal_write(SocketObject* so) {
 
 		if (!so->expectedACKBuffer.empty() && ((uint32_t )so->seq_num < so->expectedACKBuffer.rbegin()->first)) {
 			// During retransmission;
-			// TO DO :: 차례로 다음것을 보내는 코드 만들기. (지금은 맨처음껏만 계속 보냄)
 			struct packet_data *pd = so->expectedACKBuffer[so->seq_num - so->local_seq_base + MSS]; // MSS 아닐때?
 			Packet* packet = pd->packet;
 			size_t writeSize = packet->getSize() - TCP_DATA_OFFSET;
@@ -429,7 +428,7 @@ void TCPAssignment::internal_write(SocketObject* so) {
 				so->seq_num += writeSize;
 				so->sendWindowPayloadSize += writeSize;
 				if (VERBOSE)
-					printf("Port %hd\tRetransmit with ACK number %u\n", ntohs(so->get_port()), so->seq_num - so->local_seq_base + MSS);
+					printf("Port %hu\tRetransmit with ACK number %u\n", ntohs(so->get_port()), so->seq_num - so->local_seq_base + MSS);
 			} else {
 				break; // block write()
 			}
@@ -711,6 +710,7 @@ void TCPAssignment::packetArrived(std::string fromModule, Packet* packet)
 					} else {
 						// wait accept();
 					}
+					this->freePacket(myPacket);
 				}
 			}
 		}
@@ -746,16 +746,20 @@ void TCPAssignment::packetArrived(std::string fromModule, Packet* packet)
 				} else {
 					if (VERBOSE) printf("Client %d: FIN_WAIT_1 -> CLOSING\n", recvSo->fd);
 					recvSo->state = State::CLOSING;
+					this->freePacket(myPacket);
 					//this->send_ACK_Packet(seq_num+1, recvSo, tcp, myPacket);
 				}
 			} else {
 				if (IS_SET(flag, FLAG_ACK)) { // ACK
 					if (ntohl(tcp->ack_num) == recvSo->sent_FIN_seqnum + 1) { // ACK for FIN pacekt
 						if (VERBOSE) printf("Client %d: FIN_WAIT_1 -> FIN_WAIT_2\n", recvSo->fd);
-						recvSo->state = State::FIN_WAIT_2;	
+						recvSo->state = State::FIN_WAIT_2;
+						this->freePacket(myPacket);	
 					} else {
 						process_received_data(recvSo, tcp, myPacket);
 					}
+				} else {
+					this->freePacket(myPacket);
 				} 
 			} 
 		}
@@ -778,6 +782,7 @@ void TCPAssignment::packetArrived(std::string fromModule, Packet* packet)
 		break;
 		case State::LAST_ACK:
 		{
+			this->freePacket(myPacket);
 			if (IS_SET(flag, FLAG_ACK)) {
 				if (VERBOSE) printf("Server %d: LAST_ACK -> CLOSED \n", recvSo->fd);
 				recvSo->state = State::CLOSED;
@@ -789,6 +794,7 @@ void TCPAssignment::packetArrived(std::string fromModule, Packet* packet)
 				this->socket_map[pid].erase(fd);	
 				SystemCallInterface::removeFileDescriptor(pid, fd);
 			}
+
 		}
 		break;
 		case State::CLOSING:
@@ -802,8 +808,16 @@ void TCPAssignment::packetArrived(std::string fromModule, Packet* packet)
 				// TIME_WAIT timeout
 				TimerPayload* tp = new TimerPayload(TIMER::TIME_WAIT, recvSo);
 				TimerModule::addTimer(tp, TimeUtil::makeTime(TCP_TIMEWAIT_LEN, TimeUtil::SEC));
+			} else {
+				this->freePacket(myPacket);
 			}
 		}
+		break;
+		default:
+		{
+			this->freePacket(myPacket);
+		}
+		break;
 	}
 	this->freePacket(packet);
 	delete tcp;
@@ -836,12 +850,16 @@ void TCPAssignment::timerCallback(void* payload)
 		break;
 		case TIMER::TIME_OUT:
 		{
-			targetSo->tcpTimer = false;
+			targetSo->isTcpTimerRunning = false;
+			delete tp;
+
+			/* Return To Slow Start */
 			if (targetSo->cwnd == MSS) {
 				targetSo->sshthresh = MSS;
 			} else {
 				targetSo->sshthresh = targetSo->cwnd / 2;
 			}
+
 			targetSo->cwnd = MSS; // Return Slow start
 			targetSo->dupACKcount = 0;
 			targetSo->sendWindowPayloadSize = 0;
@@ -853,10 +871,9 @@ void TCPAssignment::timerCallback(void* payload)
 					auto oldestBuffer = targetSo->expectedACKBuffer.begin();
 					uint32_t expectedACKnum = oldestBuffer->first;
 					struct packet_data *pd = oldestBuffer->second;
-					Packet* packet = pd->packet;
-					pd->packet = this->clonePacket(packet);
-					this->sendPacket("IPv4", packet);
-					targetSo->sendWindowPayloadSize += packet->getSize() - TCP_DATA_OFFSET;
+					Packet* sendPacket = this->clonePacket(pd->packet);
+					this->sendPacket("IPv4", sendPacket);
+					targetSo->sendWindowPayloadSize += pd->packet->getSize() - TCP_DATA_OFFSET;
 					targetSo->congestionPacketSize = targetSo->cwnd;
 
 					if (VERBOSE) {
@@ -869,18 +886,19 @@ void TCPAssignment::timerCallback(void* payload)
 
 					/* start Timer */
 					pd->sent_time = currentTime();
-					targetSo->tcpTimer = TimerModule::addTimer(tp, TimeUtil::makeTime(targetSo->timeoutInterval, TimeUtil::USEC));
+					TimerPayload *tp_new = new TimerPayload(TIMER::TIME_OUT, targetSo);
+					targetSo->tcpTimer = TimerModule::addTimer(tp_new, TimeUtil::makeTime(targetSo->timeoutInterval, TimeUtil::USEC));
 					targetSo->isTcpTimerRunning = true;
 					targetSo->seq_num = expectedACKnum;
+					targetSo->timeoutInterval *= 2; // doubling timerInterval
+					targetSo->tp = tp_new;
 				}
-
 			}
-			// 연속해서 계속 다시 received된 segment도 보내는 문제?
-
-			
-			// printf("%lu elements\n", targetSo->expectedACKBuffer.size());
 		}
 		break;
+		default:
+			delete tp;
+			break;
 	}
 }
 
@@ -898,98 +916,6 @@ void TCPAssignment::process_received_data(SocketObject* so, TCPHeader* tcp, Pack
 			printf("Dup ACK!\n");
 		} else {
 			so->dupACKcount = 0;
-		}
-
-		if (so->expectedACKBuffer.count(recvACKNum) == 1) { // acceptable ACK received
-			/* Calculate RTT and Timeout Value */
-			struct packet_data *recvPd = so->expectedACKBuffer[recvACKNum];
-
-			uint32_t sampleRTT = TimeUtil::getTime(this->getHost()->getSystem()->getCurrentTime() - recvPd->sent_time, TimeUtil::USEC);
-			so->estimatedRTT = (1 - ALPHA) * so->estimatedRTT + ALPHA * sampleRTT;
-			// if(VERBOSE)
-			// 	printf("Port: %hd\tACK   %u   RTT:   %u    Time:    %lu\n", ntohs(so->get_port()), recvACKNum, sampleRTT, currentTime()/1000);
-			so->devRTT = (1 - BETA)*so->devRTT + BETA * ABS(sampleRTT, so->estimatedRTT);
-			so->timeoutInterval = so->estimatedRTT + K * 10000;
-
-			// printf("timeoutInterval%u\n",so->timeoutInterval);  
-			// if(VERBOSE) printf("congestionPacketSize:%u\n", so->congestionPacketSize);
-
-			so->receivedACKBuffer[recvACKNum] = packet;
-			
-			while (!so->receivedACKBuffer.empty()) {
-				auto received = so->receivedACKBuffer.begin();
-				auto expected = so->expectedACKBuffer.begin();
-				if (expected->first > received->first) {
-					break; // wait first expected ACK
-				}
-				struct packet_data *pd = expected->second;
-				so->sendBase = expected->first;	// Move sendBase
-				if (so->seq_num - so->local_seq_base < so->sendBase) {
-					so->seq_num = so->sendBase + so->local_seq_base;
-				}
-				uint32_t successPayloadSize = pd->packet->getSize() - TCP_DATA_OFFSET;
-				
-				/* Delete Packet from Buffer */ 
-				if (so->congestionState == Congestion::SlowStart) 
-					so->sendWindowPayloadSize -= successPayloadSize;
-				else
-					so->congestionPacketSize -= successPayloadSize;	
-				this->freePacket(expected->second->packet);
-				free(pd);
-				
-				// Free resource
-				// printf("============expectd first: %u, received first:%u\n",expected->first, received->first);
-				if (expected->first == received->first) {
-					so->receivedACKBuffer.erase(received);
-					this->freePacket(received->second);
-				}
-				so->expectedACKBuffer.erase(expected);
-			}	
-
-
-			/* Congestion control */
-			switch (so->congestionState) {
-				case Congestion::SlowStart:
-				{
-					so->cwnd += MSS;		// +MSS for every ACK
-					if (so->cwnd > so->sshthresh) {
-					if (VERBOSE) {
-						printPort(so);
-						printf("Transition: SlowStart -> CA\n");
-					}
-						so->congestionState = Congestion::Avoidance; // state Transition
-						so->congestionPacketSize = so->cwnd;
-					} 
-				}
-				break;
-				case Congestion::Avoidance:
-				{
-					if (so->congestionPacketSize <= 0) { // one RTT is finished
-						so->cwnd += MSS; // +MSS for RTT
-						so->sendWindowPayloadSize = 0;	// write can send data
-						so->congestionPacketSize =  so->cwnd;
-					} 
-				}
-				break;
-			}
-
-
-			/* Timer Management */
-			if (so->isTcpTimerRunning) {
-				TimerModule::cancelTimer(so->tcpTimer);
-				so->isTcpTimerRunning = false;
-				delete so->tp;
-			}
-			if (!so->expectedACKBuffer.empty()) { // if unacked Packet exist
-				TimerPayload *tp = new TimerPayload(TIMER::TIME_OUT, so);
-				so->tcpTimer = TimerModule::addTimer(tp, TimeUtil::makeTime(so->timeoutInterval, TimeUtil::USEC));
-				so->isTcpTimerRunning = true;
-			}
-
-			if (so->isWriting) {
-				internal_write(so);
-			}
-
 		}
 
 		if (recvDataLength > 0) { // if packet has payload
@@ -1023,7 +949,97 @@ void TCPAssignment::process_received_data(SocketObject* so, TCPHeader* tcp, Pack
 					internal_read(so);
 				}
 			}
+		} else if (so->expectedACKBuffer.count(recvACKNum) == 1) { // acceptable ACK received
+			/* Calculate RTT and Timeout Value */
+			struct packet_data *recvPd = so->expectedACKBuffer[recvACKNum];
+
+			uint32_t sampleRTT = TimeUtil::getTime(this->getHost()->getSystem()->getCurrentTime() - recvPd->sent_time, TimeUtil::USEC);
+			so->estimatedRTT = (1 - ALPHA) * so->estimatedRTT + ALPHA * sampleRTT;
+			so->devRTT = (1 - BETA)*so->devRTT + BETA * ABS(sampleRTT, so->estimatedRTT);
+			so->timeoutInterval = so->estimatedRTT + K * 10000;
+
+			so->receivedACKBuffer[recvACKNum] = packet;
+			
+			while (!so->receivedACKBuffer.empty()) {
+				auto received = so->receivedACKBuffer.begin();
+				auto expected = so->expectedACKBuffer.begin();
+				if (expected->first > received->first) {
+					break; // wait first expected ACK
+				}
+				struct packet_data *pd = expected->second;
+				so->sendBase = expected->first;	// Move sendBase
+				if (so->seq_num - so->local_seq_base < so->sendBase) {
+					so->seq_num = so->sendBase + so->local_seq_base;
+				}
+				uint32_t successPayloadSize = pd->packet->getSize() - TCP_DATA_OFFSET;
+				
+				/* Delete Packet from Buffer */ 
+				if (so->congestionState == Congestion::SlowStart) 
+					so->sendWindowPayloadSize -= successPayloadSize;
+				else
+					so->congestionPacketSize -= successPayloadSize;	
+				this->freePacket(expected->second->packet);
+				free(pd);
+				
+				// Free resource
+				// printf("============expectd first: %u, received first:%u\n",expected->first, received->first);
+				if (expected->first == received->first) {
+					this->freePacket(received->second);
+					so->receivedACKBuffer.erase(received);
+				}
+				so->expectedACKBuffer.erase(expected);
+			}	
+
+
+			/* Congestion control */
+			switch (so->congestionState) {
+				case Congestion::SlowStart:
+				{
+					so->cwnd += MSS;		// +MSS for every ACK
+					if (so->cwnd > so->sshthresh) {
+						if (VERBOSE) {
+							printPort(so);
+							printf("Transition: SlowStart -> CA\n");
+						}
+						so->congestionState = Congestion::Avoidance; // state Transition
+						so->congestionPacketSize = so->cwnd;
+					} 
+				}
+				break;
+				case Congestion::Avoidance:
+				{
+					if (so->congestionPacketSize <= 0) { // one RTT is finished
+						so->cwnd += MSS; // +MSS for RTT
+						so->sendWindowPayloadSize = 0;	// write can send data
+						so->congestionPacketSize =  so->cwnd;
+					} 
+				}
+				break;
+			}
+
+
+			/* Timer Management */
+			if (so->isTcpTimerRunning) {
+				TimerModule::cancelTimer(so->tcpTimer);
+				so->isTcpTimerRunning = false;
+				delete so->tp;
+			}
+			if (!so->expectedACKBuffer.empty()) { // if unacked Packet exist
+				TimerPayload *tp = new TimerPayload(TIMER::TIME_OUT, so);
+				so->tcpTimer = TimerModule::addTimer(tp, TimeUtil::makeTime(so->timeoutInterval, TimeUtil::USEC));
+				so->isTcpTimerRunning = true;
+				so->tp = tp;
+			}
+
+			if (so->isWriting) {
+				internal_write(so);
+			}
+
+		} else {
+			this->freePacket(packet);
 		}
+	} else {
+		this->freePacket(packet);
 	}
 }
 

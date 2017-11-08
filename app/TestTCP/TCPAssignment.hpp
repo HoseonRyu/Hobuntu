@@ -156,7 +156,6 @@ public:
 	TimerPayload* tp;
 	uint32_t nextACKNum;
 
-
 	SocketObject(){}
 	SocketObject(int pid_, int fd_){
 		this->pid = pid_;
@@ -192,6 +191,10 @@ public:
 		this->recvWindowBuffer = {};
 		this->expected_recvSeqNum = 0;
 
+		this->expectedACKBuffer = {};
+		this->receivedACKBuffer = {};
+
+
 		this->read_internalIndex = -1;
 		this->local_seq_base = 0;
 
@@ -209,6 +212,7 @@ public:
 
 		this->syscallUUID = 0;
 		this->congestionState = Congestion::SlowStart;
+		this->tp = NULL;
 
 	}
 
@@ -400,6 +404,7 @@ class TCPAssignment : public HostModule, public NetworkModule, public SystemCall
 {
 public:
 	std::map<int, std::map<int, SocketObject*>> socket_map;
+	std::map<uint32_t, Packet *> packetMap;
 private:
 	virtual void timerCallback(void* payload) final;
 public:
